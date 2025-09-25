@@ -33,9 +33,9 @@ def import_and_resample_files(file_paths, target_frequency, start_date_filter=No
 
 print("\n--- Downloading Price Data via yfinance ---")
 tickers = [
-    "CEMA.L", "EXSA.DE", "CSPX.AS", "NQSE.DE", "IBZL.MI", "HSTE.PA", "CNKY.L", "TPXH.PA",
-    "CNYE.MI", "DAXEX.SW", "CACC.PA", "LEER.DE", "CN1.PA", "CEB4.DE", "LYXIB.MC", "EWI",
-    "GRE.PA", "RS2K.DE", "CSINDU.SW", "LTAMM.XC", "IUES.L", "IUMS.L", "IUIS.L", "IUCD.L", "IUCS.L", "IUHC.L", "IUFS.L",
+    "SPY", "MDY", "IJR", "XLU", "XLK", "XLV", "XLF", "XLY",
+    "XLP", "XLE", "XLI", "IYR", "EWJ", "EWG", "EWU", "EWC",
+    "EWA", "EWW", "EWS", "EWH", "XLB"
 ]
 
 # Download the full OHLCV data

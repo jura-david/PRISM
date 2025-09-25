@@ -32,6 +32,7 @@ using XGBoost
 using GLM
 using StatsModels
 using JSON # Added for state management
+using JLD2
 
 # --- Python Module Declarations ---
 # Declare global constants for Python modules, initialized to PyNULL.
@@ -50,12 +51,18 @@ const skl_decomposition = PyNULL()
 const epsilon = 1e-8
 const TARGET_VARIABLE = "Information_Ratio"
 const FORECAST_PLOTS_DIR = joinpath("Plots", "Forecast")
+const CHECKPOINT_DIR = joinpath("Data", "Checkpoints")
+const EVAL_STATS_DIR = joinpath("Data", "EvalStats")
+const LOGS_DIR = "Logs"
+const STANDALONE_STATE_FILE = joinpath(LOGS_DIR, "standalone_pipeline_state.json")
+const STANDALONE_APSO_RESULTS = joinpath(CHECKPOINT_DIR, "standalone_apso_results.csv")
 
 # === GLOBAL & DATA PARAMETERS ===
 const BENCHMARK = "SPY"
-const ENABLE_PLOTTING = false      # Master switch to enable/disable all plot generation
+const ENABLE_PLOTTING = true      # Master switch to enable/disable all plot generation
 # This switch is used by the backtester. When true, the main() function below will not run.
-const BACKTEST_MODE = true      # Default to standalone mode. The backtester will override this.
+const BACKTEST_MODE = false      # Default to standalone mode. The backtester will override this.
+const RESTART_AFTER_QUARTER_EXIT_CODE = 10
 
 # === STAGE 1: APSO PARAMETERS ===
 const APSO_BOOTSTRAP_SAMPLES = 1000
@@ -65,7 +72,10 @@ const APSO_MULTI_STARTS = 20
 const APSO_W_DECAY = 3.0
 const APSO_C1_DECAY = 3.0
 const APSO_C2_INCREASE = 1.0
-const APSO_DIVERSIFICATION_PENALTY = 0.5
+const APSO_PARETO_PENALTIES = 0.0:0.1:1.0
+const APSO_MAX_REFINEMENT_ATTEMPTS = 20
+const APSO_MU_INITIAL = 0.1
+const APSO_MU_INCREMENT = 0.15
 
 # === STAGE 2: FEATURE ENGINEERING PARAMETERS ===
 # --- Time Series ---
@@ -87,6 +97,8 @@ const RFE_N_ITERATIONS_PER_ROUND = 25
 const RFE_N_FEATURES_PER_ITERATION = 1
 
 # === STAGE 3: FORECASTING PARAMETERS ===
+const FC_OPTIMIZATION_MODE = :DYNAMIC # Options: :MANUAL, :DYNAMIC
+const FC_GRID_STEP = 0.5            # Step size for lambda penalties in DYNAMIC mode. Smaller is denser but slower.
 const FC_RISK_METRIC = :TrackingError # Options: :TrackingError, :Stdev, :Beta, :AvgCorrelation
 const FC_PREFERENCES = Dict("w_ir" => 0.4, "w_risk" => 0.3, "w_hhi" => 0.3)
 const FC_PCA_VARIANCE_THRESHOLD = 0.95
@@ -235,6 +247,7 @@ function multi_start_pso(objective_function, bounds, n_particles, dimensions, ma
 	w_decay_rate, c1_decay_rate, c2_increase_rate)
 	best_costs_all_starts = Float64[]
 	best_positions_all_starts = Vector{Float64}[]
+	all_runs_cost_history = []
 	w_initial, w_final = 0.9, 0.4
 	c1_initial, c1_final = 2.5, 0.5
 	c2_initial, c2_final = 0.5, 2.5
@@ -242,6 +255,7 @@ function multi_start_pso(objective_function, bounds, n_particles, dimensions, ma
 	for start in 1:n_starts
 		options = py"dict"(c1 = c1_initial, c2 = c2_initial, w = w_initial)
 		optimizer = pso.GlobalBestPSO(n_particles = n_particles, dimensions = dimensions, options = options, bounds = bounds)
+		cost_history = Float64[]
 
 		for i in 1:max_iter
 			w = adaptive_inertia_weight(i, max_iter; w_max = w_initial, w_min = w_final, decay_rate = w_decay_rate)
@@ -253,13 +267,15 @@ function multi_start_pso(objective_function, bounds, n_particles, dimensions, ma
 			optimizer.swarm.options["c2"] = c2
 
 			optimizer.optimize(objective_function, iters = 1, verbose = false)
+			push!(cost_history, optimizer.swarm.best_cost)
 		end
 		push!(best_costs_all_starts, optimizer.swarm.best_cost)
 		push!(best_positions_all_starts, convert(Vector{Float64}, optimizer.swarm.best_pos))
+		push!(all_runs_cost_history, cost_history)
 	end
 
 	best_idx = argmin(best_costs_all_starts)
-	return best_positions_all_starts[best_idx]
+	return best_positions_all_starts[best_idx], best_costs_all_starts, all_runs_cost_history
 end
 
 function perform_bootstrap_analysis_on_weights(log_returns, benchmark_returns, fixed_weights, n_bootstrap_samples)
@@ -309,6 +325,7 @@ function create_summary_distribution_plot(data, title_suffix, color)
 		d_std = std(numeric_data)
 		d_skew = skewness(numeric_data)
 		d_kurt = kurtosis(numeric_data)
+		d_n = length(numeric_data)
 
 		Plots.histogram!(plt, numeric_data, bins = 20, normalize = :pdf, alpha = 0.7, label = "Distribution", color = color)
 		Plots.vline!(plt, [d_mean], color = :black, style = :dash, linewidth = 2, label = "Mean")
@@ -320,268 +337,268 @@ function create_summary_distribution_plot(data, title_suffix, color)
 		Plots.scatter!(plt, [NaN], [NaN], label = @sprintf("Std Dev: %.3f", d_std), markeralpha = 0, color = :transparent)
 		Plots.scatter!(plt, [NaN], [NaN], label = @sprintf("Skew: %.3f", d_skew), markeralpha = 0, color = :transparent)
 		Plots.scatter!(plt, [NaN], [NaN], label = @sprintf("Kurtosis: %.3f", d_kurt), markeralpha = 0, color = :transparent)
+		Plots.scatter!(plt, [NaN], [NaN], label = @sprintf("N: %d", d_n), markeralpha = 0, color = :transparent)
 	end
 	center_plot_around_zero!([numeric_data])
 	return plt
 end
 
 # --- 1.2 MAIN APSO ORCHESTRATOR ---
-# MODIFIED: state_file_path and output_csv_path are now optional
 function run_apso_stage(market_quarterly, prices_weekly;
 	n_bootstrap_samples, set_particles, set_iters_pso, set_starts,
 	pso_w_decay_rate, pso_c1_decay_rate, pso_c2_increase_rate,
-	diversification_penalty, benchmark,
+	diversification_penalty_grid, benchmark,
 	state_file_path = nothing, output_csv_path = nothing)
 
-	# --- Initial Data Prep (run once) ---
+	# --- Initial Data Prep ---
 	if isempty(prices_weekly) || isempty(market_quarterly)
-		return nothing, nothing, 0, 0;
+		return nothing, nothing, 0, 0
 	end
 	if !(eltype(prices_weekly.Date) <: Date)
-		prices_weekly.Date = Date.(prices_weekly.Date);
+		prices_weekly.Date = Date.(prices_weekly.Date)
 	end
 	if !(eltype(market_quarterly.Date) <: Date)
-		market_quarterly.Date = Date.(market_quarterly.Date);
+		market_quarterly.Date = Date.(market_quarterly.Date)
 	end
 
 	benchmark_col_name = benchmark
 	if benchmark_col_name ∉ names(prices_weekly)
-		println("ERROR: Benchmark '$(benchmark_col_name)' not found.");
-		return nothing, nothing, 0, 0;
+		println("ERROR: Benchmark '$(benchmark_col_name)' not found.")
+		return nothing, nothing, 0, 0
 	end
 	master_stock_cols = [col for col in names(prices_weekly) if col != benchmark_col_name && col != "Date"]
 	if isempty(master_stock_cols)
-		return nothing, nothing, 0, 0;
+		return nothing, nothing, 0, 0
 	end
 
-	all_results_df = DataFrame()
+	all_results_df, all_pareto_results_df = DataFrame(), DataFrame()
 	quarters_to_process = unique(firstdayofquarter.(market_quarterly.Date))
 	last_completed_quarter = Date(1900, 1, 1)
+	local state = Dict()
+	apso_loop_executed = false
 
 	# --- Resumability Logic ---
-	if BACKTEST_MODE && state_file_path !== nothing && output_csv_path !== nothing
-		state = isfile(state_file_path) ? JSON.parsefile(state_file_path) : Dict()
+	current_state_file = BACKTEST_MODE ? state_file_path : STANDALONE_STATE_FILE
+	current_output_csv = BACKTEST_MODE ? output_csv_path : STANDALONE_APSO_RESULTS
+	pareto_checkpoint_path = joinpath(CHECKPOINT_DIR, "apso_pareto_quarterly_stats.csv")
+
+	if current_state_file !== nothing && current_output_csv !== nothing
+		state = isfile(current_state_file) ? JSON.parsefile(current_state_file) : Dict()
 		last_completed_quarter_str = get(get(state, "apso", Dict()), "last_completed_quarter", "1900-01-01")
 		last_completed_quarter = Date(last_completed_quarter_str)
 
-		all_results_df = if isfile(output_csv_path) && last_completed_quarter > Date(1900, 1, 1)
-			println("--- Found existing partial APSO results. Loading from $(output_csv_path) ---")
-			df = CSV.read(output_csv_path, DataFrame);
-			df.Date = Date.(df.Date);
-			df
-		else
-			DataFrame()
+		if isfile(current_output_csv) && last_completed_quarter > Date(1900, 1, 1)
+			println("--- Found existing partial APSO results. Loading from $(current_output_csv) ---")
+			all_results_df = CSV.read(current_output_csv, DataFrame)
+			all_results_df.Date = Date.(all_results_df.Date)
+		end
+		if isfile(pareto_checkpoint_path) && last_completed_quarter > Date(1900, 1, 1)
+			println("--- Found existing Pareto checkpoint data. Loading from $(pareto_checkpoint_path) ---")
+			all_pareto_results_df = CSV.read(pareto_checkpoint_path, DataFrame)
+			all_pareto_results_df.Date = Date.(all_pareto_results_df.Date)
 		end
 
-		quarters_to_process = filter(q -> q > last_completed_quarter, unique(firstdayofquarter.(market_quarterly.Date)))
+		quarters_to_process = filter(q -> q > last_completed_quarter, quarters_to_process)
 		if !isempty(all_results_df) && last_completed_quarter > Date(1900, 1, 1)
 			println("--- Resuming from quarter: $(isempty(quarters_to_process) ? "N/A" : first(quarters_to_process)) ---")
 		end
 	end
 
 	# --- Main Loop Setup ---
-	market_quarterly_sorted = sort(market_quarterly, :Date)
-
 	MIN_WEEKLY_OBSERVATIONS_PER_QUARTER = 10
-	successful_quarters_count = 0;
-	unsuccessful_quarters_count = 0
+	successful_quarters_count, unsuccessful_quarters_count = 0, 0
 	previous_quarter_weights = zeros(length(master_stock_cols))
+	plot_data_aggregator = Dict("all_costs" => [], "all_histories" => [], "all_bootstrap_samples" => [])
 
-	prog = Progress(length(quarters_to_process), "APSO Calculation:")
-	for (i, quarter_start) in enumerate(quarters_to_process)
-		ProgressMeter.update!(prog, i; showvalues = [(:status, "Processing quarter $(quarter_start)")])
-
-		quarter_end = lastdayofquarter(quarter_start)
-
-		prices_in_quarter = filter(row -> quarter_start <= row.Date <= quarter_end, prices_weekly)
-
-		tradable_stocks_in_quarter = String[]
-		for stock in master_stock_cols
-			if hasproperty(prices_in_quarter, Symbol(stock))
-				valid_prices = filter(x -> !ismissing(x), prices_in_quarter[!, Symbol(stock)])
-				if length(valid_prices) >= MIN_WEEKLY_OBSERVATIONS_PER_QUARTER
-					push!(tradable_stocks_in_quarter, stock)
-				end
+	function save_state_and_results(current_quarter_result::DataFrame, current_pareto_df::DataFrame, quarter_start::Date)
+		if current_state_file !== nothing && current_output_csv !== nothing
+			CSV.write(current_output_csv, current_quarter_result; append = isfile(current_output_csv) && filesize(current_output_csv) > 0)
+			CSV.write(pareto_checkpoint_path, current_pareto_df; append = isfile(pareto_checkpoint_path) && filesize(pareto_checkpoint_path) > 0)
+			get!(state, "apso", Dict())["last_completed_quarter"] = string(quarter_start)
+			open(current_state_file, "w") do f
+				JSON.print(f, state, 4)
 			end
 		end
+	end
+
+	prog = Progress(length(quarters_to_process), "APSO Pareto Calculation:")
+	for (i, quarter_start) in enumerate(quarters_to_process)
+		apso_loop_executed = true
+		ProgressMeter.update!(prog, i, showvalues = [(:quarter, quarter_start)])
+
+		quarter_end = lastdayofquarter(quarter_start)
+		prices_in_quarter = filter(row -> quarter_start <= row.Date <= quarter_end, prices_weekly)
+		tradable_stocks_in_quarter = [stock for stock in master_stock_cols if hasproperty(prices_in_quarter, Symbol(stock)) && count(!ismissing, prices_in_quarter[!, Symbol(stock)]) >= MIN_WEEKLY_OBSERVATIONS_PER_QUARTER]
 
 		if length(tradable_stocks_in_quarter) < 2
-			println("Skipping quarter $(quarter_start): insufficient tradable assets.");
-			if BACKTEST_MODE
-				blank_weights = zeros(length(master_stock_cols))
-				weights_matrix = reshape(blank_weights, 1, :)
-				optimal_weights_df = DataFrame(weights_matrix, Symbol.(master_stock_cols .* "_Weight"));
-				optimal_weights_df.Date = [quarter_start]
-				ir_df = DataFrame(Date = [quarter_start], Information_Ratio = [0.0])
-				ci_df = DataFrame(Date = [quarter_start], IR_CI_Lower = [0.0], IR_CI_Upper = [0.0])
-
-				current_quarter_result = innerjoin(ir_df, optimal_weights_df; on = :Date)
-				market_data_for_join = filter(row -> row.Date == quarter_start, select(market_quarterly, Not(r"_Weight$")))
-				if !isempty(market_data_for_join)
-					current_quarter_result = innerjoin(market_data_for_join, current_quarter_result; on = :Date)
-				end
-				current_quarter_result = innerjoin(current_quarter_result, ci_df; on = :Date)
-				all_results_df = vcat(all_results_df, current_quarter_result)
-				CSV.write(output_csv_path, current_quarter_result; append = isfile(output_csv_path) && filesize(output_csv_path) > 0)
+			println("Skipping quarter $(quarter_start): insufficient tradable assets.")
+			blank_weights = zeros(length(master_stock_cols))
+			weights_matrix = reshape(blank_weights, 1, :)
+			optimal_weights_df = DataFrame(weights_matrix, Symbol.(master_stock_cols .* "_Weight"))
+			optimal_weights_df.Date = [quarter_start]
+			ir_df = DataFrame(Date = [quarter_start], Information_Ratio = [0.0])
+			ci_df = DataFrame(Date = [quarter_start], IR_CI_Lower = [0.0], IR_CI_Upper = [0.0])
+			current_quarter_result = innerjoin(ir_df, optimal_weights_df, ci_df, on = :Date)
+			market_data_for_join = filter(row -> row.Date == quarter_start, select(market_quarterly, Not(r"_Weight$")))
+			if !isempty(market_data_for_join)
+				current_quarter_result = innerjoin(market_data_for_join, current_quarter_result, on = :Date)
 			end
-			continue;
+
+			blank_pareto_df = DataFrame(Date = quarter_start, Penalty = 0.0, IR = 0.0, HHI = 0.0, CI_Lower = 0.0, CI_Upper = 0.0)
+			save_state_and_results(current_quarter_result, blank_pareto_df, quarter_start)
+			println("--- APSO quarter for $(quarter_start) complete. Exiting with code $(RESTART_AFTER_QUARTER_EXIT_CODE) to signal restart. ---")
+			exit(RESTART_AFTER_QUARTER_EXIT_CODE)
 		end
 
 		log_ret(p) = [NaN; log.(p[2:end] ./ p[1:(end-1)])]
 		clean_val(x) = !isfinite(x) ? 0.0 : x
-
-		stock_returns_quarter = DataFrame()
-		for col in tradable_stocks_in_quarter
-			returns = clean_val.(log_ret(coalesce.(prices_in_quarter[:, Symbol(col)], NaN)))
-			stock_returns_quarter[!, col] = winsorize_series(returns)
-		end
-
-		benchmark_returns_quarter = DataFrame()
-		bench_returns = clean_val.(log_ret(coalesce.(prices_in_quarter[:, Symbol(benchmark_col_name)], NaN)))
-		benchmark_returns_quarter[!, "Benchmark"] = winsorize_series(bench_returns)
-
+		stock_returns_quarter = DataFrame([col => winsorize_series(clean_val.(log_ret(coalesce.(prices_in_quarter[:, Symbol(col)], NaN)))) for col in tradable_stocks_in_quarter])
+		benchmark_log_returns_in_quarter = winsorize_series(clean_val.(log_ret(coalesce.(prices_in_quarter[:, Symbol(benchmark_col_name)], NaN))))
 		log_returns_in_quarter = Matrix(stock_returns_quarter)
-		benchmark_log_returns_in_quarter = Matrix(benchmark_returns_quarter)
 		num_stocks = size(log_returns_in_quarter, 2)
 
-		aligned_previous_weights = zeros(num_stocks)
 		master_idx_map = Dict(name => idx for (idx, name) in enumerate(master_stock_cols))
-		for (new_idx, stock_name) in enumerate(tradable_stocks_in_quarter)
-			if haskey(master_idx_map, stock_name)
-				master_idx = master_idx_map[stock_name]
-				aligned_previous_weights[new_idx] = previous_quarter_weights[master_idx]
-			end
-		end
+		aligned_previous_weights = [get(master_idx_map, s, 0) > 0 ? previous_quarter_weights[master_idx_map[s]] : 0.0 for s in tradable_stocks_in_quarter]
 
 		excess_returns = log_returns_in_quarter .- benchmark_log_returns_in_quarter
-		quarterly_shrunk_cov_matrix = if all(var(excess_returns, dims = 1, corrected = false) .< 1e-10)
-			zeros(num_stocks, num_stocks)
-		else
-			lw = sklearn_covariance.LedoitWolf();
-			lw.fit(excess_returns);
-			convert(Matrix{Float64}, lw."covariance_")
-		end
+		lw = sklearn_covariance.LedoitWolf()
+		lw.fit(excess_returns)
+		quarterly_shrunk_cov_matrix = convert(Matrix{Float64}, lw."covariance_")
 
-		max_refinement_attempts = 10;
-		mu_val = 0.2;
-		mu_increment = 0.4
-		found_robust_solution = false
-		best_fallback_solution = Dict("weights" => zeros(num_stocks), "ir" => 0.0, "ci" => (-Inf, -Inf))
+		quarterly_pareto_results = []
+		for penalty_val in diversification_penalty_grid
+			mu_val = APSO_MU_INITIAL
+			best_fallback_solution = Dict("weights" => zeros(num_stocks), "ir" => 0.0, "ci" => (-Inf, -Inf))
+			for attempt in 1:APSO_MAX_REFINEMENT_ATTEMPTS
+				try
+					pso_bounds = (fill(-1.0, num_stocks), fill(1.0, num_stocks))
+					pso_objective_func =
+						create_pso_objective_function(log_returns_in_quarter, benchmark_log_returns_in_quarter, quarterly_shrunk_cov_matrix, num_stocks; mu = mu_val, diversification_penalty = penalty_val, previous_weights = aligned_previous_weights)
 
-		for attempt in 1:max_refinement_attempts
-			try
-				pso_bounds = (fill(-1.0, num_stocks), fill(1.0, num_stocks))
-				pso_objective_func = create_pso_objective_function(
-					log_returns_in_quarter,
-					benchmark_log_returns_in_quarter,
-					quarterly_shrunk_cov_matrix,
-					num_stocks;
-					mu = mu_val,
-					diversification_penalty = diversification_penalty,
-					previous_weights = aligned_previous_weights,
-				)
-				pso_best_solution = multi_start_pso(pso_objective_func, pso_bounds, set_particles, num_stocks, set_iters_pso, set_starts, pso_w_decay_rate, pso_c1_decay_rate, pso_c2_increase_rate)
+					pso_best_solution, pso_final_costs, pso_cost_histories = multi_start_pso(pso_objective_func, pso_bounds, set_particles, num_stocks, set_iters_pso, set_starts, pso_w_decay_rate, pso_c1_decay_rate, pso_c2_increase_rate)
+					append!(plot_data_aggregator["all_costs"], pso_final_costs)
+					append!(plot_data_aggregator["all_histories"], pso_cost_histories)
 
-				x0_sum = sum(abs.(pso_best_solution))
-				x0 = x0_sum > 0 ? (pso_best_solution ./ x0_sum) .* 100.0 : zeros(num_stocks)
-				slsqp_bounds = [(0.0, 100.0) for _ in 1:num_stocks]
-				constraints = py"dict"(type = "eq", fun = (w -> sum(abs.(w)) - 100.0))
-				options_slsqp = py"dict"(disp = false, ftol = 1e-9, maxiter = 200)
-				scipy_obj_wrapper(w) = portfolio_objective_function(convert(Vector{Float64}, w), log_returns_in_quarter, benchmark_log_returns_in_quarter, quarterly_shrunk_cov_matrix, mu_val, diversification_penalty, aligned_previous_weights, num_stocks)
-				slsqp_result = sp.optimize.minimize(scipy_obj_wrapper, x0; method = "SLSQP", bounds = slsqp_bounds, constraints = constraints, options = options_slsqp)
+					x0_sum = sum(abs.(pso_best_solution))
+					x0 = x0_sum > 0 ? (pso_best_solution ./ x0_sum) .* 100.0 : zeros(num_stocks)
+					slsqp_bounds = [(-100.0, 100.0) for _ in 1:num_stocks]
+					constraints = py"dict"(type = "eq", fun = (w -> sum(abs.(w)) - 100.0))
+					options_slsqp = py"dict"(disp = false, ftol = 1e-9, maxiter = 200)
+					scipy_obj_wrapper(w) = portfolio_objective_function(convert(Vector{Float64}, w), log_returns_in_quarter, benchmark_log_returns_in_quarter, quarterly_shrunk_cov_matrix, mu_val, penalty_val, aligned_previous_weights, num_stocks)
+					slsqp_result = sp.optimize.minimize(scipy_obj_wrapper, x0; method = "SLSQP", bounds = slsqp_bounds, constraints = constraints, options = options_slsqp)
+					final_optimal_weights_unrounded = slsqp_result["success"] ? convert(Vector{Float64}, slsqp_result["x"]) : x0
 
-				final_optimal_weights_unrounded = slsqp_result["success"] ? convert(Vector{Float64}, slsqp_result["x"]) : x0
+					bootstrap_ir_samples = perform_bootstrap_analysis_on_weights(log_returns_in_quarter, benchmark_log_returns_in_quarter, final_optimal_weights_unrounded, n_bootstrap_samples)
 
-				bootstrap_ir_samples = perform_bootstrap_analysis_on_weights(log_returns_in_quarter, benchmark_log_returns_in_quarter, final_optimal_weights_unrounded, n_bootstrap_samples)
-				ci_lower, ci_upper = percentile(bootstrap_ir_samples, [2.5, 97.5])
-				gross_port_return = calculate_quarterly_return(log_returns_in_quarter, final_optimal_weights_unrounded)
-				bench_return = exp(sum(benchmark_log_returns_in_quarter)) - 1
-				track_error = calculate_shrunk_tracking_error(final_optimal_weights_unrounded, quarterly_shrunk_cov_matrix)
-				information_ratio = track_error > 1e-8 ? (gross_port_return - bench_return) / track_error : 0.0
-
-				if ci_lower > best_fallback_solution["ci"][1]
-					best_fallback_solution = Dict("weights" => final_optimal_weights_unrounded, "ir" => information_ratio, "ci" => (ci_lower, ci_upper));
+					ci_lower, ci_upper = percentile(bootstrap_ir_samples, [2.5, 97.5])
+					gross_port_return = calculate_quarterly_return(log_returns_in_quarter, final_optimal_weights_unrounded)
+					bench_return = exp(sum(benchmark_log_returns_in_quarter)) - 1
+					track_error = calculate_shrunk_tracking_error(final_optimal_weights_unrounded, quarterly_shrunk_cov_matrix)
+					information_ratio = track_error > 1e-8 ? (gross_port_return - bench_return) / track_error : 0.0
+					if ci_lower > best_fallback_solution["ci"][1]
+						best_fallback_solution = Dict("weights" => final_optimal_weights_unrounded, "ir" => information_ratio, "ci" => (ci_lower, ci_upper))
+					end
+					if ci_lower > 0
+						append!(plot_data_aggregator["all_bootstrap_samples"], bootstrap_ir_samples)
+						break
+					end
+					mu_val += APSO_MU_INCREMENT
+				catch e
+					println("CRITICAL ERROR in APSO for quarter $(quarter_start): $e")
+					continue
 				end
-				if ci_lower > 0
-					found_robust_solution = true;
-					break;
-				end
-				mu_val += mu_increment
-			catch e
-				println("CRITICAL ERROR in APSO for quarter $(quarter_start): $e");
-				continue;
 			end
+			final_weights_unrounded_for_penalty = best_fallback_solution["weights"]
+			hhi = sum((final_weights_unrounded_for_penalty ./ 100.0) .^ 2)
+			push!(
+				quarterly_pareto_results,
+				Dict("Date"=>quarter_start, "Penalty"=>penalty_val, "IR"=>best_fallback_solution["ir"], "HHI"=>hhi, "CI_Lower"=>best_fallback_solution["ci"][1], "CI_Upper"=>best_fallback_solution["ci"][2], "Weights"=>final_weights_unrounded_for_penalty),
+			)
 		end
 
-		if !found_robust_solution
-			unsuccessful_quarters_count += 1;
+		if isempty(quarterly_pareto_results)
+			println("WARNING: No valid Pareto results for quarter $(quarter_start). Saving blank and restarting.")
+			best_result_for_quarter = Dict("IR" => 0.0, "CI_Lower" => 0.0, "CI_Upper" => 0.0, "Weights" => zeros(num_stocks))
 		else
-			successful_quarters_count += 1;
+			best_result_for_quarter = quarterly_pareto_results[argmax([res["CI_Lower"] for res in quarterly_pareto_results])]
 		end
 
-		final_weights_unrounded = best_fallback_solution["weights"]
-		final_ir = best_fallback_solution["ir"]
-		final_ci = best_fallback_solution["ci"]
-		final_weights_rounded = round.(final_weights_unrounded; digits = 2)
-		residual = sum(abs.(final_weights_rounded)) - 100.0
-		if abs(residual) > 1e-6 && sum(abs.(final_weights_rounded)) > 0
-			_, largest_pos_idx = findmax(abs.(final_weights_rounded))
-			final_weights_rounded[largest_pos_idx] -= residual
+		final_ir = best_result_for_quarter["IR"]
+		final_ci = (best_result_for_quarter["CI_Lower"], best_result_for_quarter["CI_Upper"])
+		final_weights = best_result_for_quarter["Weights"]
+		if final_ci[1] > 0
+			successful_quarters_count += 1
+		else
+			unsuccessful_quarters_count += 1
 		end
-		final_weights = final_weights_rounded
-
-		new_previous_weights = zeros(length(master_stock_cols))
-		for (idx, stock_name) in enumerate(tradable_stocks_in_quarter)
-			master_idx = master_idx_map[stock_name]
-			new_previous_weights[master_idx] = final_weights[idx]
-		end
-		previous_quarter_weights = new_previous_weights
 
 		full_quarter_weights = zeros(length(master_stock_cols))
 		for (idx, stock_name) in enumerate(tradable_stocks_in_quarter)
-			master_idx = master_idx_map[stock_name]
-			full_quarter_weights[master_idx] = final_weights[idx]
+			full_quarter_weights[master_idx_map[stock_name]] = final_weights[idx]
 		end
+		previous_quarter_weights = full_quarter_weights
 
 		weights_matrix = reshape(full_quarter_weights, 1, :)
-		optimal_weights_df = DataFrame(weights_matrix, Symbol.(master_stock_cols .* "_Weight"));
+		optimal_weights_df = DataFrame(weights_matrix, Symbol.(master_stock_cols .* "_Weight"))
 		optimal_weights_df.Date = [quarter_start]
 		ir_df = DataFrame(Date = [quarter_start], Information_Ratio = [final_ir])
 		ci_df = DataFrame(Date = [quarter_start], IR_CI_Lower = [final_ci[1]], IR_CI_Upper = [final_ci[2]])
-
-		current_quarter_result = innerjoin(ir_df, optimal_weights_df; on = :Date)
+		current_quarter_result = innerjoin(ir_df, optimal_weights_df, on = :Date)
 		market_data_for_join = filter(row -> row.Date == quarter_start, select(market_quarterly, Not(r"_Weight$")))
 		if !isempty(market_data_for_join)
-			current_quarter_result = innerjoin(market_data_for_join, current_quarter_result; on = :Date)
+			current_quarter_result = innerjoin(market_data_for_join, current_quarter_result, on = :Date)
 		end
-		current_quarter_result = innerjoin(current_quarter_result, ci_df; on = :Date)
+		current_quarter_result = innerjoin(current_quarter_result, ci_df, on = :Date)
+
+		current_pareto_df = DataFrame(
+			Date = [res["Date"] for res in quarterly_pareto_results],
+			Penalty = [res["Penalty"] for res in quarterly_pareto_results],
+			IR = [res["IR"] for res in quarterly_pareto_results],
+			HHI = [res["HHI"] for res in quarterly_pareto_results],
+			CI_Lower = [res["CI_Lower"] for res in quarterly_pareto_results],
+			CI_Upper = [res["CI_Upper"] for res in quarterly_pareto_results],
+		)
 
 		all_results_df = vcat(all_results_df, current_quarter_result)
+		all_pareto_results_df = vcat(all_pareto_results_df, current_pareto_df)
 
-		if BACKTEST_MODE && state_file_path !== nothing && output_csv_path !== nothing
-			CSV.write(output_csv_path, current_quarter_result; append = isfile(output_csv_path) && filesize(output_csv_path) > 0)
-			get!(state, "apso", Dict())["last_completed_quarter"] = string(quarter_start)
-			open(state_file_path, "w") do f
-				JSON.print(f, state, 4);
-			end
-		end
+		save_state_and_results(current_quarter_result, current_pareto_df, quarter_start)
+		println("--- APSO quarter for $(quarter_start) complete. Exiting with code $(RESTART_AFTER_QUARTER_EXIT_CODE) to signal restart. ---")
+		exit(RESTART_AFTER_QUARTER_EXIT_CODE)
 	end
 	ProgressMeter.finish!(prog)
 
-	if ENABLE_PLOTTING && !isempty(all_results_df)
+	if ENABLE_PLOTTING && !isempty(all_results_df) && apso_loop_executed
 		println("\n", "="^25, " GENERATING AND SAVING APSO PLOTS ", "="^25)
-		plot_dir = joinpath(pwd(), "Plots", "APSO");
+		plot_dir = joinpath(pwd(), "Plots", "APSO")
 		mkpath(plot_dir)
+		if !isempty(all_pareto_results_df)
+			avg_pareto = combine(groupby(all_pareto_results_df, :Penalty), :CI_Lower => mean => :Avg_CI_Lower, :HHI => mean => :Avg_HHI)
+			sort!(avg_pareto, :Penalty)
+			frontier_df = DataFrame(Penalty = Float64[], Avg_CI_Lower = Float64[], Avg_HHI = Float64[])
+			max_ci_so_far = -Inf
+			for row in eachrow(avg_pareto)
+				if row.Avg_CI_Lower > max_ci_so_far
+					push!(frontier_df, row)
+					max_ci_so_far = row.Avg_CI_Lower
+				end
+			end
+			p_pareto = plot(frontier_df.Avg_HHI, frontier_df.Avg_CI_Lower, title = "Average Pareto Frontier", xlabel = "Average HHI", ylabel = "Average Lower CI Bound", legend = false, lw = 3, marker = :circle)
+			scatter!(p_pareto, avg_pareto.Avg_HHI, avg_pareto.Avg_CI_Lower, color = :grey, alpha = 0.6, marker = :x)
+			hline!(p_pareto, [0], lw = 1.5, ls = :dash, color = :red)
+			savefig(p_pareto, joinpath(plot_dir, "average_pareto_frontier.png"))
+			println("Saved average Pareto frontier plot.")
+		end
 		weight_columns = [col for col in names(all_results_df) if endswith(string(col), "_Weight")]
 		weights_only_df = all_results_df[:, weight_columns]
 		plot_df = Matrix(weights_only_df)
 		assets = [replace(string(c), "_Weight" => "") for c in weight_columns]
 		quarters = string.(all_results_df.Date)
 		custom_cmap = cgrad([:lightgreen, :green, :yellow, :orange, :red], [0.0, 0.25, 0.50, 0.75, 1.0])
-		h1 = Plots.heatmap(quarters, assets, plot_df'; c = custom_cmap, clims = (0, 100), title = "Portfolio Composition (4-Tiered Colorscale)", size = (2000, 1600), xrotation = 45, yticks = (1:length(assets), assets), ytickfontsize = 6)
+		h1 = Plots.heatmap(quarters, assets, plot_df'; c = custom_cmap, clims = (0, 100), title = "Portfolio Composition (Custom Colors)", size = (2000, 1600), xrotation = 45, yticks = (1:length(assets), assets), ytickfontsize = 6)
 		Plots.savefig(h1, joinpath(plot_dir, "heatmap_composition_custom.png"))
 		plot_df_nan = replace(plot_df, 0 => NaN)
-		h2 = Plots.heatmap(quarters, assets, plot_df_nan'; c = :viridis, clims = (0, 100), title = "Portfolio Composition (Standard Colorscale, Zeros Hidden)", size = (2000, 1600), xrotation = 45, yticks = (1:length(assets), assets), ytickfontsize = 6)
+		h2 = Plots.heatmap(quarters, assets, plot_df_nan'; c = :viridis, clims = (0, 100), title = "Portfolio Composition (Zeros Hidden)", size = (2000, 1600), xrotation = 45, yticks = (1:length(assets), assets), ytickfontsize = 6)
 		Plots.savefig(h2, joinpath(plot_dir, "heatmap_composition_standard.png"))
 		weights_frac = weights_only_df ./ 100.0
 		hhi = sum(Matrix(weights_frac .^ 2); dims = 2)[:]
@@ -592,15 +609,92 @@ function run_apso_stage(market_quarterly, prices_weekly;
 		Plots.plot!(h3, quarters, eq_w_hhi; marker = :x, style = :dash, c = :red, label = "Equal-Weight HHI (for context)")
 		Plots.annotate!(h3, (0.02, 0.02), Plots.text("Average HHI: $(round(mean(hhi), digits=3))", :left, :bottom, 12, "white"), :axes)
 		Plots.savefig(h3, joinpath(plot_dir, "hhi_over_time.png"))
+
 		println("\n--- Generating Final Summary Subplots ---")
-		successful_results = filter(row -> row.IR_CI_Lower > 0, all_results_df)
-		unsuccessful_results = filter(row -> row.IR_CI_Lower <= 0, all_results_df)
-		p_ir_s = create_summary_distribution_plot(successful_results.Information_Ratio, "Information Ratios (Successful)", :green)
-		p_ir_u = create_summary_distribution_plot(unsuccessful_results.Information_Ratio, "Information Ratios (Unsuccessful)", :red)
-		p_ci_l = create_summary_distribution_plot(all_results_df.IR_CI_Lower, "Lower CI Bounds (All Quarters)", :blue)
-		p_ci_u = create_summary_distribution_plot(all_results_df.IR_CI_Upper, "Upper CI Bounds (All Quarters)", :purple)
-		final_layout = Plots.plot(p_ir_s, p_ir_u, p_ci_l, p_ci_u; layout = (2, 2), size = (1600, 1200), plot_title = "Summary Distributions")
+		successful_results = filter(row -> row.CI_Lower > 0, all_pareto_results_df)
+		unsuccessful_results = filter(row -> row.CI_Lower <= 0, all_pareto_results_df)
+
+		p_ir_s = create_summary_distribution_plot(successful_results.IR, "IRs (Successful)", :green)
+		p_ir_u = create_summary_distribution_plot(unsuccessful_results.IR, "IRs (Unsuccessful)", :red)
+		p_ci_l_s = create_summary_distribution_plot(successful_results.CI_Lower, "Lower CI (Successful)", :darkgreen)
+		p_ci_l_u = create_summary_distribution_plot(unsuccessful_results.CI_Lower, "Lower CI (Unsuccessful)", :darkred)
+		p_ci_u_s = create_summary_distribution_plot(successful_results.CI_Upper, "Upper CI (Successful)", :purple)
+		p_ci_u_u = create_summary_distribution_plot(unsuccessful_results.CI_Upper, "Upper CI (Unsuccessful)", :orange)
+		final_layout = Plots.plot(p_ir_s, p_ir_u, p_ci_l_s, p_ci_l_u, p_ci_u_s, p_ci_u_u; layout = (3, 2), size = (1600, 1800), plot_title = "Summary Distributions")
 		Plots.savefig(final_layout, joinpath(plot_dir, "summary_distributions.png"))
+
+		# --- Generate and Save NEW plots ---
+		println("--- Generating and saving detailed optimization plots ---")
+
+		# 1. PSO Costs Distribution Plot
+		if !isempty(plot_data_aggregator["all_costs"])
+			all_costs_flat = vcat(plot_data_aggregator["all_costs"]...)
+			p_costs_dist = histogram(all_costs_flat, normalize = :pdf, bins = 30, label = "Cost Distribution",
+				title = "Distribution of Best PSO Costs Across All Runs",
+				xlabel = "Cost", ylabel = "Density", legend = :topright, alpha = 0.7)
+			vline!(p_costs_dist, [minimum(all_costs_flat)], color = :red, style = :dash, lw = 2,
+				label = @sprintf("Overall Best Cost: %.4f", minimum(all_costs_flat)))
+			savefig(p_costs_dist, joinpath(plot_dir, "pso_costs_distribution.png"))
+			println("Saved PSO costs distribution plot.")
+		end
+
+		# 2. PSO Convergence Plot
+		if !isempty(plot_data_aggregator["all_histories"])
+			histories = plot_data_aggregator["all_histories"]
+			max_len = maximum(length.(histories))
+			padded_histories = map(h -> vcat(h, fill(h[end], max_len - length(h))), histories)
+			history_matrix = hcat(padded_histories...)'
+			mean_conv = mean(history_matrix, dims = 1)[:]
+			std_conv = std(history_matrix, dims = 1)[:]
+
+			p_conv = plot(1:max_len, mean_conv, ribbon = std_conv, fillalpha = 0.2, lw = 2,
+				label = "Mean Cost", color = :blue,
+				title = "Average PSO Convergence Across All Attempts & Runs",
+				xlabel = "Iteration", ylabel = "Cost")
+			plot!(p_conv, 1:max_len, mean_conv, label = "", color = :blue, lw = 2)
+			savefig(p_conv, joinpath(plot_dir, "pso_convergence.png"))
+			println("Saved PSO convergence plot.")
+		end
+
+		# 3. Bootstrap IR Distribution
+		if !isempty(plot_data_aggregator["all_bootstrap_samples"])
+			all_samples = vcat(plot_data_aggregator["all_bootstrap_samples"]...)
+			ir_mean = mean(all_samples)
+			ir_skew = skewness(all_samples)
+			ir_kurt = kurtosis(all_samples)
+			ci_l, ci_u = percentile(all_samples, [2.5, 97.5])
+
+			p_bootstrap = histogram(all_samples, normalize = :pdf, bins = 50, label = "IR Distribution",
+				title = @sprintf("Bootstrap IR Distribution (Skew: %.2f, Kurtosis: %.2f)", ir_skew, ir_kurt),
+				xlabel = "Information Ratio", ylabel = "Density", legend = :topright, alpha = 0.7)
+			vline!(p_bootstrap, [ir_mean], style = :dash, color = :red, lw = 2, label = @sprintf("Mean IR: %.4f", ir_mean))
+			vline!(p_bootstrap, [ci_l], style = :dash, color = :green, lw = 2, label = "2.5% CI")
+			vline!(p_bootstrap, [ci_u], style = :dash, color = :green, lw = 2, label = "97.5% CI")
+			savefig(p_bootstrap, joinpath(plot_dir, "bootstrap_ir_distribution.png"))
+			println("Saved aggregate bootstrap IR distribution plot.")
+		end
+
+		function get_stats(data, name)
+			numeric_data = filter(x -> isa(x, Number) && isfinite(x), data)
+			if isempty(numeric_data)
+				return DataFrame(Metric = name, Mean = NaN, Median = NaN, StdDev = NaN, Skewness = NaN, Kurtosis = NaN, N = 0)
+			end
+			d_mean, d_median, d_std, d_skew, d_kurt, d_n = mean(numeric_data), median(numeric_data), std(numeric_data), skewness(numeric_data), kurtosis(numeric_data), length(numeric_data)
+			return DataFrame(Metric = name, Mean = d_mean, Median = d_median, StdDev = d_std, Skewness = d_skew, Kurtosis = d_kurt, N = d_n)
+		end
+		stats_df = vcat(
+			get_stats(successful_results.IR, "IR_Successful"),
+			get_stats(unsuccessful_results.IR, "IR_Unsuccessful"),
+			get_stats(successful_results.CI_Lower, "IR_CI_Lower_Successful"),
+			get_stats(unsuccessful_results.CI_Lower, "IR_CI_Lower_Unsuccessful"),
+			get_stats(successful_results.CI_Upper, "IR_CI_Upper_Successful"),
+			get_stats(unsuccessful_results.CI_Upper, "IR_CI_Upper_Unsuccessful"),
+			get_stats(all_pareto_results_df.HHI, "HHI_All"),
+		)
+		mkpath(EVAL_STATS_DIR)
+		stats_path = joinpath(EVAL_STATS_DIR, "apso_summary_stats.csv")
+		CSV.write(stats_path, stats_df)
+		println("Saved APSO summary statistics to '$(stats_path)'.")
 		println("Saved all APSO stage plots to 'Plots/APSO'.")
 	end
 
@@ -663,10 +757,9 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 			all_new_features_df[!, Symbol("$(target_name)_lag_$(lag_val)")] = ShiftedArrays.lag(target_series[!, target_name], lag_val)
 		end
 
-		# Rolling features with a new safety check
+		# Rolling features
 		for col in feature_cols
 			for window in window_vals
-				# CHECK: Only create rolling features if the data is long enough
 				if nrow(features_df) >= window
 					rolled_mean = rollmean(features_df[!, col], window)
 					padded_mean = vcat(fill(missing, window - 1), rolled_mean)
@@ -676,7 +769,6 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 					padded_std = vcat(fill(missing, window - 1), rolled_std)
 					all_new_features_df[!, Symbol("$(col)_rolling_std_$(window)q")] = padded_std
 				else
-					# ELSE: If data is too short, create empty/neutral feature columns
 					all_new_features_df[!, Symbol("$(col)_rolling_mean_$(window)q")] = zeros(nrow(features_df))
 					all_new_features_df[!, Symbol("$(col)_rolling_std_$(window)q")] = zeros(nrow(features_df))
 				end
@@ -690,10 +782,11 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 		all_new_features_df.quarter_cos = cos.(2 * π * all_new_features_df.quarter_of_year / 4)
 
 		ts_features = all_new_features_df
+
 		for col in names(ts_features, Not(:Date))
-			ts_features[!, col] = coalesce.(ts_features[!, col], 0.0)
-			ts_features[!, col] = map(x -> isinf(x) ? 0.0 : x, ts_features[!, col])
+			ts_features[!, col] = map(x -> ismissing(x) || !isfinite(x) ? 0.0 : x, ts_features[!, col])
 		end
+
 		return ts_features
 	end
 
@@ -713,15 +806,21 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 
 	println("\n--- 2.4 Generating Time-Series Features ---")
 	X_train_ts_engineered = generate_ts_features(X_train_engineered_raw, y_train)
-	X_train_ts = innerjoin(X_train_ts_engineered, X_train_weights, on = :Date)
+	X_train_ts_unaligned = innerjoin(X_train_ts_engineered, X_train_weights, on = :Date)
 	println("Generated $(ncol(X_train_ts_engineered) - 1) time-series features.")
 
-	println("\n--- 2.5 Dynamic MI Pre-selection ---")
-	X_train_ts_matrix = Matrix(X_train_ts[:, Not(:Date)])
-	y_train_vector = y_train[!, TARGET_VARIABLE]
+	# --- 2.5 Final Data Alignment ---
+	train_df = innerjoin(X_train_ts_unaligned, y_train, on = :Date)
+	println("Data aligned. Final training set size: $(nrow(train_df)) rows.")
+
+	y_train_vector = train_df[!, TARGET_VARIABLE]
+	feature_cols = names(train_df, Not([:Date, Symbol(TARGET_VARIABLE)]))
+	X_train_ts_matrix = Matrix(train_df[:, feature_cols])
+
+	println("\n--- 2.5.1 Dynamic MI Pre-selection ---")
 	println("Calculating MI scores using scikit-learn...")
 	mi_scores_vec = skl_feature_selection.mutual_info_regression(X_train_ts_matrix, y_train_vector, random_state = 42)
-	mi_scores_df = DataFrame(Feature = names(X_train_ts, Not(:Date)), MI = mi_scores_vec)
+	mi_scores_df = DataFrame(Feature = feature_cols, MI = mi_scores_vec)
 	sort!(mi_scores_df, :MI, rev = true)
 	mi_selected_engineered = String[]
 	local final_mi_features
@@ -749,7 +848,7 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 		mi_selected_engineered = first(engineered_mi_scores_fallback, mi_fallback_n).Feature
 	end
 	final_mi_features = [mi_selected_engineered; protected_weight_features]
-	X_train_mi = X_train_ts[:, [:Date; Symbol.(final_mi_features)]]
+	X_train_mi = train_df[:, [:Date; Symbol.(final_mi_features)]]
 	println("Selected $(length(final_mi_features)) features after MI step.")
 
 	if ENABLE_PLOTTING
@@ -822,11 +921,13 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 	println("Expanded to $(ncol(X_train_poly_engineered) - 1) polynomial features.")
 
 	println("\n--- 2.7 SULOV Selection ---")
-	X_train_poly_numeric = X_train_poly[:, Not(:Date)]
+	sulov_train_df = innerjoin(X_train_poly, y_train, on = :Date)
+	X_train_poly_numeric = sulov_train_df[:, Not([:Date, Symbol(TARGET_VARIABLE)])]
+	y_train_poly_vector = sulov_train_df[!, TARGET_VARIABLE]
 	corr_matrix = cor(Matrix(X_train_poly_numeric))
 	feature_names_sulov = names(X_train_poly_numeric)
 	println("Calculating MI scores for SULOV step...")
-	mis_scores_sulov_vec = skl_feature_selection.mutual_info_regression(Matrix(X_train_poly_numeric), y_train_vector, random_state = 42)
+	mis_scores_sulov_vec = skl_feature_selection.mutual_info_regression(Matrix(X_train_poly_numeric), y_train_poly_vector, random_state = 42)
 	mis_scores_sulov = Dict(zip(feature_names_sulov, mis_scores_sulov_vec))
 	correlated_pairs_for_plot = []
 	features_to_remove_candidates = Set{String}()
@@ -872,14 +973,12 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 			g = SimpleGraph();
 			node_map = Dict{String, Int}();
 			for name in nodes_to_plot
-				;
 				add_vertex!(g);
 				node_map[name] = nv(g);
 			end
 			id_to_name_map = Dict(v => k for (k, v) in node_map)
 			for (src, tgt, w) in correlated_pairs_for_plot
 				if haskey(node_map, src) && haskey(node_map, tgt)
-					;
 					add_edge!(g, node_map[src], node_map[tgt]);
 				end
 			end
@@ -902,16 +1001,9 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 					colors = [get(connection_counts_all, name, 0) for name in names];
 					sizes = [get(mis_scores_sulov, name, 0) * 150 + 5 for name in names];
 					Plots.scatter!(
-						p,
-						[pos[i][1] for i in indices],
-						[pos[i][2] for i in indices],
-						marker_z = colors,
-						markersize = sizes,
-						seriescolor = :viridis,
-						markerstrokewidth = 0.5,
-						alpha = 0.6,
-						colorbar = show_colorbar,
-						colorbar_title = show_colorbar ? "\n# Connections" : "",
+						p, [pos[i][1] for i in indices], [pos[i][2] for i in indices],
+						marker_z = colors, markersize = sizes, seriescolor = :viridis, markerstrokewidth = 0.5,
+						alpha = 0.6, colorbar = show_colorbar, colorbar_title = show_colorbar ? "\n# Connections" : "",
 						clims = (min_z, max_z),
 					)
 				end
@@ -959,14 +1051,17 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 	end
 
 	println("\n--- 2.9 Multi-Round SHAP-RFE with Optuna Tuning ---")
-	X_train_sulov_matrix = Matrix(X_train_sulov[:, Not(:Date)])
-	y_train_vec = y_train[!, TARGET_VARIABLE]
-	X_valid_sulov_matrix = Matrix(X_valid_sulov[:, Not(:Date)])
-	y_valid_vec = y_valid[!, TARGET_VARIABLE]
+	rfe_train_df = innerjoin(X_train_sulov, y_train, on = :Date)
+	rfe_valid_df = innerjoin(X_valid_sulov, y_valid, on = :Date)
+
+	X_train_sulov_matrix = Matrix(rfe_train_df[:, names(X_train_sulov, Not(:Date))])
+	y_train_vec = rfe_train_df[!, TARGET_VARIABLE]
+	X_valid_sulov_matrix = Matrix(rfe_valid_df[:, names(X_train_sulov, Not(:Date))])
+	y_valid_vec = rfe_valid_df[!, TARGET_VARIABLE]
+
 	function objective(trial)
 		params = Dict(
-			"objective" => "reg:squarederror",
-			"eval_metric" => "rmse",
+			"objective" => "reg:squarederror", "eval_metric" => "rmse",
 			"n_estimators" => trial.suggest_int("n_estimators", 100, 1000, step = 100),
 			"learning_rate" => trial.suggest_float("learning_rate", 0.01, 0.3, log = true),
 			"max_depth" => trial.suggest_int("max_depth", 3, 8),
@@ -979,20 +1074,11 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 		dtrain = DMatrix(X_train_sulov_matrix, y_train_vec)
 		dvalid = DMatrix(X_valid_sulov_matrix, y_valid_vec)
 		watchlist = Dict("validation" => dvalid)
-		model = xgboost(
-			dtrain;
-			watchlist = watchlist,
-			num_round = params["n_estimators"],
-			eta = params["learning_rate"],
-			max_depth = params["max_depth"],
-			subsample = params["subsample"],
-			colsample_bytree = params["colsample_bytree"],
-			alpha = params["reg_alpha"],
-			lambda = params["reg_lambda"],
-			objective = params["objective"],
-			eval_metric = params["eval_metric"],
-			seed = params["random_state"],
-			verbose_eval = false,
+		model = xgboost(dtrain; watchlist = watchlist, num_round = params["n_estimators"],
+			eta = params["learning_rate"], max_depth = params["max_depth"], subsample = params["subsample"],
+			colsample_bytree = params["colsample_bytree"], alpha = params["reg_alpha"], lambda = params["reg_lambda"],
+			objective = params["objective"], eval_metric = params["eval_metric"],
+			seed = params["random_state"], verbose_eval = false,
 		)
 		preds = XGBoost.predict(model, X_valid_sulov_matrix)
 		mse = mean((y_valid_vec .- preds) .^ 2)
@@ -1003,17 +1089,11 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 	best_params_py = study.best_params
 	best_params_optuna = Dict(k => v for (k, v) in best_params_py)
 	best_params = Dict(
-		:num_round => best_params_optuna["n_estimators"],
-		:eta => best_params_optuna["learning_rate"],
-		:max_depth => best_params_optuna["max_depth"],
-		:subsample => best_params_optuna["subsample"],
-		:colsample_bytree => best_params_optuna["colsample_bytree"],
-		:alpha => best_params_optuna["reg_alpha"],
-		:lambda => best_params_optuna["reg_lambda"],
-		:objective => "reg:squarederror",
-		:eval_metric => "rmse",
-		:seed => 42,
-		:verbose_eval => false,
+		:num_round => best_params_optuna["n_estimators"], :eta => best_params_optuna["learning_rate"],
+		:max_depth => best_params_optuna["max_depth"], :subsample => best_params_optuna["subsample"],
+		:colsample_bytree => best_params_optuna["colsample_bytree"], :alpha => best_params_optuna["reg_alpha"],
+		:lambda => best_params_optuna["reg_lambda"], :objective => "reg:squarederror",
+		:eval_metric => "rmse", :seed => 42, :verbose_eval => false,
 	)
 	println("Best parameters for RFE model found by Optuna: $(best_params_optuna)")
 
@@ -1023,8 +1103,8 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 	println("\n--- Starting SHAP-RFE with Tuned Parameters ---")
 	for i in 1:RFE_N_ROUNDS
 		println("\n--- Round $i/$RFE_N_ROUNDS ---")
-		boot_indices = StatsBase.sample(1:nrow(X_train_sulov), nrow(X_train_sulov), replace = true)
-		X_train_boot, y_train_boot = X_train_sulov[boot_indices, :], y_train[boot_indices, :]
+		boot_indices = StatsBase.sample(1:nrow(rfe_train_df), nrow(rfe_train_df), replace = true)
+		train_boot_df = rfe_train_df[boot_indices, :]
 		features_in_play = copy(rfe_engineered_features)
 		selected_this_round = []
 		for j in 1:RFE_N_ITERATIONS_PER_ROUND
@@ -1032,10 +1112,10 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 				break
 			end
 			current_training_features_sym = Symbol.([features_in_play; protected_weight_features])
-			X_train_boot_iter_df = X_train_boot[:, current_training_features_sym]
-			y_train_boot_iter = y_train_boot[!, TARGET_VARIABLE]
-			X_valid_iter_df = X_valid_sulov[:, current_training_features_sym]
-			y_valid_iter = y_valid[!, TARGET_VARIABLE]
+			X_train_boot_iter_df = train_boot_df[:, current_training_features_sym]
+			y_train_boot_iter = train_boot_df[!, TARGET_VARIABLE]
+			X_valid_iter_df = rfe_valid_df[:, current_training_features_sym]
+			y_valid_iter = rfe_valid_df[!, TARGET_VARIABLE]
 			dtrain_iter = DMatrix(Matrix(X_train_boot_iter_df), y_train_boot_iter)
 			dvalid_iter = DMatrix(Matrix(X_valid_iter_df), y_valid_iter)
 			temp_model = xgboost(dtrain_iter; watchlist = Dict("validation" => dvalid_iter), best_params...)
@@ -1068,41 +1148,27 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 	X_valid_final = X_valid_sulov[:, [:Date; Symbol.(final_selected_features)]]
 	X_test_ts_engineered = generate_ts_features(X_test_engineered_raw, y_test)
 	X_test_ts = innerjoin(X_test_ts_engineered, X_test_weights, on = :Date)
-	X_test_mi = DataFrame(Date = X_test_ts.Date)
-	n_test = nrow(X_test_mi)
-	for feat in final_mi_features
-		if Symbol(feat) in names(X_test_ts)
-			X_test_mi[!, Symbol(feat)] = X_test_ts[!, Symbol(feat)]
-		else
-			X_test_mi[!, Symbol(feat)] = fill(0.0, n_test)
-		end
-	end
-	X_test_mi_engineered_df = X_test_mi[:, filter(c -> !(string(c) in protected_weight_features), names(X_test_mi))]
-	X_test_mi_weights_df = X_test_mi[:, [:Date; Symbol.(protected_weight_features)]]
-	X_test_numeric_cols_df = X_test_mi_engineered_df[:, Not(:Date)]
-	X_test_mi_engineered_scaled_matrix = py_scaler.transform(Matrix(X_test_numeric_cols_df))
-	X_test_mi_engineered_scaled = DataFrame(X_test_mi_engineered_scaled_matrix, names(X_test_numeric_cols_df))
-	X_test_poly_engineered_matrix = poly_transformer.transform(Matrix(X_test_mi_engineered_scaled))
-	X_test_poly_engineered = DataFrame(X_test_poly_engineered_matrix, Symbol.(poly_feature_names))
-	X_test_poly_engineered.Date = X_test_mi.Date
-	X_test_poly = innerjoin(X_test_poly_engineered, X_test_mi_weights_df, on = :Date)
-	X_test_sulov = DataFrame(Date = X_test_poly.Date)
-	for feat in sulov_selected_features
-		if Symbol(feat) in names(X_test_poly)
-			X_test_sulov[!, Symbol(feat)] = X_test_poly[!, Symbol(feat)]
-		else
-			X_test_sulov[!, Symbol(feat)] = fill(0.0, n_test)
-		end
-	end
-	X_test_final = X_test_sulov[:, [:Date; Symbol.(final_selected_features)]]
+	X_test_final = X_test_ts[:, [:Date; Symbol.(final_selected_features)]]
+
 	X_train_val_combined = vcat(X_train_final, X_valid_final);
 	sort!(X_train_val_combined, :Date)
 	y_train_val_combined = vcat(y_train, y_valid);
 	sort!(y_train_val_combined, :Date)
-	X_train_val_df = X_train_val_combined[:, Not(:Date)];
-	y_train_val_vec = y_train_val_combined[!, TARGET_VARIABLE]
-	X_test_final_df = X_test_final[:, Not(:Date)];
-	y_test_vec = y_test[!, TARGET_VARIABLE]
+	final_train_df = innerjoin(X_train_val_combined, y_train_val_combined, on = :Date)
+	final_test_df = innerjoin(X_test_final, y_test, on = :Date)
+
+	X_train_val_df = final_train_df[:, Not([:Date, Symbol(TARGET_VARIABLE)])];
+	y_train_val_vec = final_train_df[!, TARGET_VARIABLE]
+	X_test_final_df = final_test_df[:, Not([:Date, Symbol(TARGET_VARIABLE)])];
+	y_test_vec = final_test_df[!, TARGET_VARIABLE]
+
+	for col in names(X_train_val_df)
+		if col ∉ names(X_test_final_df)
+			X_test_final_df[!, col] .= 0.0
+		end
+	end
+	X_test_final_df = X_test_final_df[:, names(X_train_val_df)]
+
 	dtrain_final = DMatrix(Matrix(X_train_val_df), y_train_val_vec)
 	dtest_final = DMatrix(Matrix(X_test_final_df), y_test_vec)
 	final_model = xgboost(dtrain_final; watchlist = Dict("train" => dtrain_final, "test" => dtest_final), best_params...)
@@ -1133,15 +1199,10 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 			all_selected_union = sort(unique(vcat(all_round_features...)))
 			if !isempty(all_selected_union)
 				p1 = Plots.heatmap(
-					1:RFE_N_ROUNDS,
-					all_selected_union,
+					1:RFE_N_ROUNDS, all_selected_union,
 					cumsum([feat in round_features for feat in all_selected_union, round_features in all_round_features], dims = 2),
-					c = :viridis,
-					title = "Feature Stability Heatmap",
-					xlabel = "Selection Round",
-					ylabel = "Engineered Feature",
-					yflip = true,
-					size = (1200, max(600, length(all_selected_union) * 20)),
+					c = :viridis, title = "Feature Stability Heatmap", xlabel = "Selection Round",
+					ylabel = "Engineered Feature", yflip = true, size = (1200, max(600, length(all_selected_union) * 20)),
 				)
 				Plots.savefig(p1, "Plots/Features/rfe_stability_heatmap.png")
 			end
@@ -1150,14 +1211,9 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 				freq_df = DataFrame(Feature = collect(keys(feature_counts)), Frequency = collect(values(feature_counts)));
 				sort!(freq_df, :Frequency)
 				p2 = @df freq_df Plots.scatter(
-					:Frequency,
-					1:nrow(freq_df),
-					yticks = (1:nrow(freq_df), :Feature),
-					legend = false,
-					title = "Feature Selection Frequency",
-					xlabel = "Number of Rounds Selected",
-					ylabel = "Engineered Feature",
-					size = (1000, max(600, nrow(freq_df) * 25)),
+					:Frequency, 1:nrow(freq_df), yticks = (1:nrow(freq_df), :Feature),
+					legend = false, title = "Feature Selection Frequency", xlabel = "Number of Rounds Selected",
+					ylabel = "Engineered Feature", size = (1000, max(600, nrow(freq_df) * 25)),
 				)
 				Plots.savefig(p2, "Plots/Features/rfe_frequency_lollipop.png")
 			end
@@ -1186,9 +1242,11 @@ function run_feature_engineering_stage(apso_output_df::DataFrame;
 		println("Saved all Feature Engineering plots to 'Plots/Features'.")
 	end
 
-
 	# --- 2.11 Return Final Features DataFrame ---
-	final_features_full_dataset = vcat(X_train_final, X_valid_final, X_test_final)
+	final_train_val_df_no_target = final_train_df[:, Not(Symbol(TARGET_VARIABLE))]
+	final_test_df_no_target = final_test_df[:, Not(Symbol(TARGET_VARIABLE))]
+
+	final_features_full_dataset = vcat(final_train_val_df_no_target, final_test_df_no_target)
 	sort!(final_features_full_dataset, :Date)
 	final_export_df = innerjoin(final_features_full_dataset, target_df, on = :Date)
 	select!(final_export_df, :Date, Symbol(TARGET_VARIABLE), Not([:Date, Symbol(TARGET_VARIABLE)]))
@@ -1201,6 +1259,77 @@ end
 ## ------------------------------------------------------------------------------------------
 
 # --- 3.1 Forecasting Helper Functions ---
+
+"""
+Generates a grid of preference weights for the Pareto frontier analysis.
+Each combination [w_ir, w_risk, w_hhi] sums to 1.
+"""
+function generate_pareto_grid(step::Float64)
+	grid = Vector{Dict{String, Float64}}()
+	for w_ir in 0:step:1
+		for w_risk in 0:step:(1-w_ir)
+			w_hhi = 1.0 - w_ir - w_risk
+			# Ensure the final weight is approximately correct due to floating point math
+			if w_hhi >= -1e-9
+				push!(grid, Dict("w_ir" => w_ir, "w_risk" => w_risk, "w_hhi" => round(w_hhi, digits = 2)))
+			end
+		end
+	end
+	return grid
+end
+
+"""
+Creates an interactive 3D plot of the Pareto frontier results.
+"""
+function plot_pareto_frontier(pareto_results)
+	println("\n--- Generating 3D Interactive Pareto Frontier Plot ---")
+
+	# Extract data for plotting
+	risks = [res.risk for res in pareto_results]
+	hhis = [res.hhi for res in pareto_results]
+	irs = [res.ir for res in pareto_results]
+
+	# Create hover text for each point
+	hover_texts = [
+		"IR: $(round(res.ir, digits=3))<br>Risk (TE): $(round(res.risk, digits=4))<br>HHI: $(round(res.hhi, digits=3))<br>---<br>w_ir: $(res.prefs["w_ir"])<br>w_risk: $(res.prefs["w_risk"])<br>w_hhi: $(res.prefs["w_hhi"])"
+		for res in pareto_results
+	]
+
+	# Define the 3D scatter plot trace
+	trace = PlotlyJS.scatter3d(
+		x = risks,
+		y = hhis,
+		z = irs,
+		mode = "markers",
+		hoverinfo = "text",
+		text = hover_texts,
+		marker = attr(
+			size = 5,
+			color = irs,                # Color by Information Ratio
+			colorscale = "Viridis",     # Colorscale
+			colorbar = attr(title = "Information Ratio"),
+			showscale = true,
+		),
+	)
+
+	# Define the layout for the plot
+	layout = PlotlyJS.Layout(
+		title = "3D Pareto Frontier: IR vs. Risk vs. HHI",
+		scene = attr(
+			xaxis_title = "Risk (Tracking Error)",
+			yaxis_title = "HHI (Concentration)",
+			zaxis_title = "Predicted Information Ratio",
+		),
+		margin = attr(l = 0, r = 0, b = 0, t = 40),
+	)
+
+	# Create the plot object and save it as an interactive HTML file
+	p = PlotlyJS.plot(trace, layout)
+	path = joinpath(FORECAST_PLOTS_DIR, "pareto_frontier_3d.html")
+	PlotlyJS.savefig(p, path)
+	println("Saved interactive Pareto plot to '$(path)'")
+end
+
 
 function build_prediction_row(full_weights_vector, fixed_pca_features_matrix, master_weight_cols, pca_feature_names, all_model_features)
 	fixed_features_df = DataFrame(fixed_pca_features_matrix, pca_feature_names)
@@ -1426,40 +1555,99 @@ function run_forecasting_stage(final_features_df::DataFrame, prices_weekly_df::D
 	X_predict_non_weight_scaled = pca_scaler.transform(X_predict_non_weight)
 	fixed_pca_features_matrix = pca.transform(X_predict_non_weight_scaled)
 
-	println("\n--- Stage 3.7: Tuning with NOMAD.jl ---")
-	lower_bounds, upper_bounds, x0 = [0.01, 0.01, 0.01], [5.0, 5.0, 5.0], [0.5, 0.5, 0.5]
-	opts = NOMAD.NomadOptions(max_bb_eval = nomad_max_evals, display_degree = 1)
-
+	# --- Common setup for optimization ---
 	model_coeffs = DataFrame(Feature = all_model_features, Coeff = final_model.coef_)
 	main_prior_weights_all = [abs(get(model_coeffs[model_coeffs.Feature .== w, :Coeff], 1, 0.0)) for w in master_weight_cols]
-
 	tradable_indices = [i for (i, w_col) in enumerate(master_weight_cols) if w_col in tradable_weight_cols]
 	prior_weights_tradable = main_prior_weights_all[tradable_indices]
 	prior_weights_tradable ./= (sum(prior_weights_tradable) + epsilon)
 	dynamic_bounds = [(0.0, 1.0) for _ in 1:length(tradable_universe)]
+	local best_hyperparams
 
-	nomad_obj_func =
-		(x) -> nomad_objective_function(
-			x,
-			FC_PREFERENCES,
-			final_model,
-			model_scaler,
-			fixed_pca_features_matrix,
-			master_weight_cols,
-			tradable_weight_cols,
-			pca_feature_names,
-			all_model_features,
-			excess_cov_matrix,
-			absolute_cov_matrix,
-			correlation_matrix, # Pass the new matrix
-			asset_returns_matrix,
-			benchmark_returns_vector,
-			prior_weights_tradable,
-			dynamic_bounds,
-		)
-	p = NOMAD.NomadProblem(3, 1, ["OBJ"], nomad_obj_func; lower_bound = lower_bounds, upper_bound = upper_bounds, options = opts)
-	result = NOMAD.solve(p, x0)
-	best_hyperparams = hasproperty(result, :x_best_feas) ? result.x_best_feas : result.x
+	if FC_OPTIMIZATION_MODE == :MANUAL
+		println("\n--- Stage 3.7: Tuning with NOMAD.jl (MANUAL Mode) ---")
+		lower_bounds, upper_bounds, x0 = [0.01, 0.01, 0.01], [5.0, 5.0, 5.0], [0.5, 0.5, 0.5]
+		opts = NOMAD.NomadOptions(max_bb_eval = nomad_max_evals, display_degree = 1)
+		nomad_obj_func =
+			(x) -> nomad_objective_function(
+				x, FC_PREFERENCES, final_model, model_scaler, fixed_pca_features_matrix, master_weight_cols,
+				tradable_weight_cols, pca_feature_names, all_model_features, excess_cov_matrix, absolute_cov_matrix,
+				correlation_matrix, asset_returns_matrix, benchmark_returns_vector, prior_weights_tradable, dynamic_bounds,
+			)
+		p = NOMAD.NomadProblem(3, 1, ["OBJ"], nomad_obj_func; lower_bound = lower_bounds, upper_bound = upper_bounds, options = opts)
+		result = NOMAD.solve(p, x0)
+		best_hyperparams = hasproperty(result, :x_best_feas) ? result.x_best_feas : result.x
+		println("Using manually set preferences: $(FC_PREFERENCES)")
+
+	elseif FC_OPTIMIZATION_MODE == :DYNAMIC
+		println("\n--- Stage 3.7: Dynamic Tuning with Pareto Frontier (DYNAMIC Mode) ---")
+		pareto_grid = generate_pareto_grid(FC_GRID_STEP)
+		println("Generated a Pareto grid with $(length(pareto_grid)) preference combinations.")
+		pareto_results = []
+
+		prog = Progress(length(pareto_grid), "Evaluating Pareto Grid:")
+		for prefs in pareto_grid
+			lower_bounds, upper_bounds, x0 = [0.01, 0.01, 0.01], [5.0, 5.0, 5.0], [0.5, 0.5, 0.5]
+			# Reduce NOMAD evaluations per point to manage total runtime
+			evals_per_point = max(100, Int(floor(nomad_max_evals / length(pareto_grid))))
+			opts = NOMAD.NomadOptions(max_bb_eval = evals_per_point, display_degree = 0, quiet = true)
+			nomad_obj_func_grid =
+				(x) -> nomad_objective_function(
+					x, prefs, final_model, model_scaler, fixed_pca_features_matrix, master_weight_cols,
+					tradable_weight_cols, pca_feature_names, all_model_features, excess_cov_matrix, absolute_cov_matrix,
+					correlation_matrix, asset_returns_matrix, benchmark_returns_vector, prior_weights_tradable, dynamic_bounds,
+				)
+			p = NOMAD.NomadProblem(3, 1, ["OBJ"], nomad_obj_func_grid; lower_bound = lower_bounds, upper_bound = upper_bounds, options = opts)
+			result = NOMAD.solve(p, x0)
+			current_best_hyperparams = hasproperty(result, :x_best_feas) ? result.x_best_feas : result.x
+
+			# Resolve the final weights for this preference set
+			final_sum_to_one = py"dict"(type = "eq", fun = w -> sum(w) - 1)
+			final_constraints = [final_sum_to_one]
+			final_opt_res = sp_optimize.minimize(
+				objective_optimization, prior_weights_tradable,
+				args = (
+					final_model, model_scaler, fixed_pca_features_matrix, master_weight_cols, tradable_weight_cols,
+					pca_feature_names, all_model_features, excess_cov_matrix, current_best_hyperparams[1],
+					current_best_hyperparams[2], prior_weights_tradable, current_best_hyperparams[3],
+				),
+				method = "SLSQP", bounds = dynamic_bounds, constraints = final_constraints,
+			)
+
+			if final_opt_res["success"]
+				optimal_weights = final_opt_res["x"]
+				predicted_ir =
+					-objective_optimization(optimal_weights, final_model, model_scaler, fixed_pca_features_matrix, master_weight_cols, tradable_weight_cols, pca_feature_names, all_model_features, excess_cov_matrix, 0, 0, prior_weights_tradable, 0)
+				risk = sqrt(abs(optimal_weights' * excess_cov_matrix * optimal_weights))
+				hhi = sum(optimal_weights .^ 2)
+				push!(pareto_results, (ir = predicted_ir, risk = risk, hhi = hhi, prefs = prefs, hyperparams = current_best_hyperparams))
+			end
+			next!(prog)
+		end
+
+		if isempty(pareto_results)
+			error("Pareto frontier analysis failed to produce any valid results.")
+		end
+
+		# Select the best result from the frontier based on the highest Information Ratio
+		best_point = pareto_results[argmax([res.ir for res in pareto_results])]
+		best_hyperparams = best_point.hyperparams
+
+		println("\n--- Pareto Frontier Optimal Point Selection ---")
+		@printf "Selected by maximizing predicted Information Ratio.\n"
+		@printf "  - Optimal Predicted IR:   %.4f\n" best_point.ir
+		@printf "  - Resulting Risk (TE):    %.6f\n" best_point.risk
+		@printf "  - Resulting HHI:          %.4f\n" best_point.hhi
+		println("  - Optimal Preference Weights: ", best_point.prefs)
+
+		if ENABLE_PLOTTING && !isempty(pareto_results)
+			plot_pareto_frontier(pareto_results)
+		end
+
+	else
+		error("Invalid FC_OPTIMIZATION_MODE specified.")
+	end
+
 
 	println("\n--- Stage 3.7B: Bootstrapping ---")
 	bootstrap_weights_matrix = Matrix{Float64}(undef, length(tradable_universe), n_bootstrap)
@@ -1563,12 +1751,14 @@ function run_forecasting_stage(final_features_df::DataFrame, prices_weekly_df::D
 	println("\n" * "="^50)
 	println("MODEL-BASED OPTIMIZATION COMPLETE (TUNED WITH NOMAD.JL)")
 	final_ir = -objective_optimization(optimal_weights_tradable, final_model, model_scaler, fixed_pca_features_matrix, master_weight_cols, tradable_weight_cols, pca_feature_names, all_model_features, excess_cov_matrix, 0, 0, prior_weights_tradable, 0)
+	final_te = sqrt(abs(optimal_weights_tradable' * excess_cov_matrix * optimal_weights_tradable))
+	final_hhi = sum(optimal_weights_tradable .^ 2)
 	@printf "Model's Predicted Information Ratio: %.4f\n" final_ir
-	@printf "Portfolio's Predicted Tracking Error:  %.6f\n" sqrt(abs(optimal_weights_tradable' * excess_cov_matrix * optimal_weights_tradable))
-	@printf "Portfolio's HHI (Concentration):       %.4f\n" sum(optimal_weights_tradable .^ 2)
+	@printf "Portfolio's Predicted Tracking Error:  %.6f\n" final_te
+	@printf "Portfolio's HHI (Concentration):       %.4f\n" final_hhi
 
 	println("\n--- Final Optimal Portfolio Weights ---")
-	results_text_df = sort(DataFrame(Asset = tradable_universe, Weight = optimal_weights_tradable), :Weight, rev = true)
+	results_text_df = sort(DataFrame(Asset = tradable_universe, Weight = final_weights_tradable), :Weight, rev = true)
 	results_text_df_filtered = filter(row -> row.Weight > 1e-4, results_text_df)
 	results_text_df_filtered.Weight = [@sprintf("%.2f%%", w * 100) for w in results_text_df_filtered.Weight]
 	println(results_text_df_filtered)
@@ -1581,6 +1771,19 @@ function run_forecasting_stage(final_features_df::DataFrame, prices_weekly_df::D
 	rename!(results_to_print, :CIMargin => Symbol("95% CI Margin"))
 	println(results_to_print)
 	println("="^50 * "\n")
+
+	# --- Save Forecasting Results ---
+	forecast_stats_df = DataFrame(
+		Metric = ["Predicted_IR", "Predicted_TE", "Predicted_HHI"],
+		Value = [final_ir, final_te, final_hhi],
+	)
+	final_weights_to_save = filter(row -> row.Weight > 1e-4, results_text_df)
+	mkpath(EVAL_STATS_DIR)
+	stats_path = joinpath(EVAL_STATS_DIR, "forecasting_results.csv")
+	weights_path = joinpath(EVAL_STATS_DIR, "forecasting_weights.csv")
+	CSV.write(stats_path, forecast_stats_df)
+	CSV.write(weights_path, final_weights_to_save)
+	println("Saved forecasting results and weights to '$(EVAL_STATS_DIR)'.")
 
 	if ENABLE_PLOTTING
 		feature_importance_df = DataFrame(Feature = all_model_features, Importance = abs.(final_model.coef_))
@@ -1606,7 +1809,7 @@ function run_forecasting_stage(final_features_df::DataFrame, prices_weekly_df::D
 				bottom_margin = 75*Plots.px,
 				size = (1000, 700),
 			)
-			Plots.savefig(p_hist, joinpath(FORECAST_PLOTS_DIR, "feature_importance_histogram.png"))
+			display(p_hist)
 		end
 
 		plot_df = DataFrame(Asset = tradable_universe, CurrentWeight = optimal_weights_tradable, AvgWeight = avg_weights, CIMargin = ci_margin)
@@ -1626,8 +1829,8 @@ function run_forecasting_stage(final_features_df::DataFrame, prices_weekly_df::D
 		)
 		Plots.scatter!(p_alloc, (1:num_assets) .- offset, plot_df.CurrentWeight, label = "Final Optimal Weight", marker = :square, color = :red)
 		Plots.scatter!(p_alloc, (1:num_assets) .+ offset, plot_df.AvgWeight, yerror = plot_df.CIMargin, label = "Bootstrapped Avg. Weight & 95% CI", marker = :circle, color = :blue)
-		Plots.savefig(p_alloc, joinpath(FORECAST_PLOTS_DIR, "portfolio_allocation_with_stats.png"))
-		println("Saved all forecasting plots to '$(FORECAST_PLOTS_DIR)'")
+		display(p_alloc)
+		println("Forecasting plots displayed.")
 	end
 
 	return final_weights_df, bootstrap_weights_df
@@ -1674,7 +1877,6 @@ function main()
 	println("Forecasting for quarter starting: $last_quarter_date")
 
 	# --- Stage 1: Run APSO on Training Data ---
-	# This call is now correct for standalone mode as the path arguments are not needed.
 	final_data_with_ci_result, final_data_result, successes, failures = run_apso_stage(
 		market_quarterly_train,
 		prices_weekly_train;
@@ -1685,7 +1887,7 @@ function main()
 		pso_w_decay_rate = APSO_W_DECAY,
 		pso_c1_decay_rate = APSO_C1_DECAY,
 		pso_c2_increase_rate = APSO_C2_INCREASE,
-		diversification_penalty = APSO_DIVERSIFICATION_PENALTY,
+		diversification_penalty_grid = APSO_PARETO_PENALTIES,
 		benchmark = BENCHMARK,
 	)
 
@@ -1739,11 +1941,7 @@ function main()
 	println("\n--- RUN MODE: STANDARD ---")
 	println("P&L constraint is not applied.")
 
-	# NOTE: The tradable_universe for a standalone run is all available stock columns.
-	# The backtester would provide a more specific list for a given period.
-	tradable_universe_standalone = [col for col in names(prices_weekly) if col != BENCHMARK && col != "Date"]
-
-	final_weights_df, bootstrap_weights_df = run_forecasting_stage(
+	average_weights_df = run_forecasting_stage(
 		final_features_df,
 		prices_weekly; # Pass the full weekly prices for covariance calculation
 		pca_variance_threshold = FC_PCA_VARIANCE_THRESHOLD,
@@ -1754,19 +1952,20 @@ function main()
 		nomad_max_evals = FC_NOMAD_MAX_EVALS,
 		n_bootstrap = FC_BOOTSTRAP_SAMPLES,
 		benchmark = BENCHMARK,
-		tradable_universe = tradable_universe_standalone,
 	)
 
 	println("\n" * "#"^60)
-	println("#############   FULL END-TO-END PIPELINE COMPLETE  ##############")
+	println("#############    FULL END-TO-END PIPELINE COMPLETE   ##############")
 	println("#"^60 * "\n")
 
-	if final_weights_df === nothing
+	if average_weights_df === nothing
 		println("Forecasting stage did not produce final weights.")
 	end
 end
 
-# --- Execute main() only if not in backtest mode ---
+# --- Execute main() only if not in backtest mode and run directly ---
 if !isdefined(Main, :BACKTEST_MODE) || !Main.BACKTEST_MODE
-	main()
+	if abspath(PROGRAM_FILE) == @__FILE__
+		main()
+	end
 end

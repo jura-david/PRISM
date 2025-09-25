@@ -1,0 +1,3 @@
+[console_scripts]
+getfactormodels=getfactormodels.__main__:main
+

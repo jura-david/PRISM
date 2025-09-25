@@ -3,11 +3,11 @@
 # #                  (With P&L Constraint & Full Reporting)                    #
 # ##############################################################################
 
-using CSV, DataFrames, Dates, Statistics, Random, Plots, Printf, ProgressMeter, Tables, StatsPlots, GLM, PyCall, StatsBase, LinearAlgebra, PortfolioOptimiser
+using CSV, DataFrames, Dates, Statistics, Random, Plots, Printf, ProgressMeter, Tables, StatsPlots, GLM, PyCall, StatsBase, LinearAlgebra, PortfolioOptimiser, TimeSeries, Clarabel, HiGHS, JuMP
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #
-#           --- Switches & Configuration ---
+#          --- Switches & Configuration ---
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # --- CHOOSE SCRIPT MODE ---
@@ -42,7 +42,8 @@ if RUN_MODE == :simulate
 end
 
 # ##############################################################################
-# #             SECTION 0: SHARED HELPER FUNCTIONS (FOR BOTH MODES)        #
+# #
+# #         SECTION 0: SHARED HELPER FUNCTIONS (FOR BOTH MODES)        #
 # ##############################################################################
 
 mutable struct Portfolio
@@ -55,7 +56,8 @@ function pivot_allocations_to_row(tall_df::DataFrame, forecast_date::Date)
 	for row in eachrow(tall_df)
 		row_df[!, Symbol(row.Asset * "_Weight")] = [row.Weight * 100.0]
 	end
-	return isempty(names(row_df)) ? DataFrame(Date = forecast_date) : row_df[1, :]
+	# FIX: Ensure this always returns a DataFrame, not a DataFrameRow
+	return isempty(names(row_df)) ? DataFrame(Date = forecast_date) : DataFrame(row_df[1, :])
 end
 
 function rebalance_portfolio!(portfolio::Portfolio, target_weights::DataFrameRow, prices_on_date::DataFrameRow)
@@ -176,7 +178,8 @@ if RUN_MODE == :simulate
 		for col in valid_stock_cols
 			prices = prices_slice[!, col]
 			log_returns = [NaN; log.(prices[2:end] ./ prices[1:(end-1)])]
-			returns_df[!, col] = coalesce.(log_returns, 0.0)
+			# FIX: Robustly clean missing, NaN and Inf values from log returns
+			returns_df[!, col] = map(x -> (!ismissing(x) && isfinite(x)) ? x : 0.0, log_returns)
 		end
 
 		returns_matrix = Matrix(returns_df)
@@ -256,44 +259,84 @@ if RUN_MODE == :simulate
 
 		valid_stock_cols = String[]
 		for col in stock_cols_initial
-			valid_prices = filter(x -> !ismissing(x), prices_slice[!, col])
-			if length(unique(valid_prices)) >= 2
+			# CORRECTED: Fixed typo from ismissisng to ismissing
+			if count(!ismissing, prices_slice[!, col]) >= 2
 				push!(valid_stock_cols, col)
 			end
 		end
 
 		if length(valid_stock_cols) < 2
-			println("WARNING: Not enough valid assets for HRP optimisations after filtering. Returning empty.")
+			println("WARNING: Not enough valid assets for HRP optimisations after initial filtering. Returning empty.")
 			return Dict{String, DataFrame}()
 		end
 
-		returns_df = DataFrame()
+		temp_prices = prices_slice[:, ["Date"; valid_stock_cols]]
+
+		cols_to_keep = ["Date"]
 		for col in valid_stock_cols
-			prices = prices_slice[!, col]
-			log_returns = [NaN; log.(prices[2:end] ./ prices[1:(end-1)])]
-			returns_df[!, col] = coalesce.(log_returns, 0.0)
+			if all(!ismissing, temp_prices[!, col])
+				push!(cols_to_keep, col)
+			end
 		end
 
-		returns_matrix = Matrix(returns_df)
-		returns_matrix[.!isfinite.(returns_matrix)] .= 0.0
+		final_valid_stock_cols = setdiff(cols_to_keep, ["Date"])
+
+		if length(final_valid_stock_cols) < 2
+			println("WARNING: Not enough consistently traded assets (no missing values) for HRP. Returning empty.")
+			return Dict{String, DataFrame}()
+		end
+
+		prices_for_opt = temp_prices[:, cols_to_keep]
 
 		results = Dict{String, DataFrame}()
 		try
-			port = Portfolio(returns = returns_matrix, assets = valid_stock_cols)
+			prices_matrix = Matrix(prices_for_opt[!, final_valid_stock_cols])
+			prices_ts = TimeArray(prices_for_opt.Date, prices_matrix, Symbol.(final_valid_stock_cols))
+
+			port = PortfolioOptimiser.Portfolio(; prices = prices_ts,
+				solvers = PortOptSolver(; name = :Clarabel, solver = Clarabel.Optimizer,
+					check_sol = (allow_local = true, allow_almost = true),
+					params = Dict("verbose" => false, "max_step_fraction" => 0.65)),
+				alloc_solvers = PortOptSolver(; name = :HiGHS,
+					solver = optimizer_with_attributes(HiGHS.Optimizer,
+						MOI.Silent() => true)))
+
+			mu_type = PortfolioOptimiser.MuSimple()
+			cov_type = PortfolioOptimiser.PortCovCor()
+			PortfolioOptimiser.asset_statistics!(port; mu_type = mu_type, cov_type = cov_type, set_kurt = false, set_skew = false)
+
+			PortfolioOptimiser.cluster_assets!(port)
+
+			if length(port.assets) < 2
+				println("WARNING: Not enough valid assets after PortfolioOptimiser internal filtering. Returning empty.")
+				return Dict{String, DataFrame}()
+			end
+			final_valid_stock_cols = port.assets
 
 			# HRP
-			hrp_weights = optimise(port, OptimiseOpt(method = "HRP"))
-			hrp_df = DataFrame(Asset = valid_stock_cols, Weight = hrp_weights.weights)
+			type_hrp = PortfolioOptimiser.HRP(rm = PortfolioOptimiser.SD())
+			hrp_weights = PortfolioOptimiser.optimise!(port, type_hrp)
+			hrp_df = DataFrame(Asset = final_valid_stock_cols, Weight = hrp_weights.weights)
 			results["HRP"] = pivot_allocations_to_row(hrp_df, target_date)
 
 			# HERC
-			herc_weights = optimise(port, OptimiseOpt(method = "HERC"))
-			herc_df = DataFrame(Asset = valid_stock_cols, Weight = herc_weights.weights)
+			type_herc = PortfolioOptimiser.HERC(rm = PortfolioOptimiser.CVaR())
+			herc_weights = PortfolioOptimiser.optimise!(port, type_herc)
+			herc_df = DataFrame(Asset = final_valid_stock_cols, Weight = herc_weights.weights)
 			results["HERC"] = pivot_allocations_to_row(herc_df, target_date)
 
 			# NCO
-			nco_weights = optimise(port, OptimiseOpt(method = "NCO"))
-			nco_df = DataFrame(Asset = valid_stock_cols, Weight = nco_weights.weights)
+			internal_args = PortfolioOptimiser.NCOArgs(;
+				type = PortfolioOptimiser.Trad(;
+					rm = PortfolioOptimiser.SSD(),
+					obj = PortfolioOptimiser.Sharpe(),
+				),
+			)
+
+			type_nco = PortfolioOptimiser.NCO(; internal = internal_args)
+
+			nco_weights = PortfolioOptimiser.optimise!(port, type_nco)
+			nco_df = DataFrame(Asset = final_valid_stock_cols, Weight = nco_weights.weights)
 			results["NCO"] = pivot_allocations_to_row(nco_df, target_date)
 
 		catch e
@@ -302,7 +345,6 @@ if RUN_MODE == :simulate
 
 		return results
 	end
-
 
 	function load_daily_prices(path::String)
 		println("--- Loading daily prices from '$path'...")
@@ -410,7 +452,8 @@ if RUN_MODE == :simulate
 	end
 
 	function calculate_period_statistics(histories::Dict, start_date, end_date)
-		stats = Dict("Rebalance_Date" => start_date)
+		# FIX: Explicitly define dictionary value type as Any to avoid type inference issues
+		stats = Dict{String, Any}("Rebalance_Date" => start_date)
 
 		function get_hpr(p_slice)
 			if isempty(p_slice) || nrow(p_slice) < 2
@@ -733,31 +776,32 @@ if RUN_MODE == :simulate
 						end
 					end
 
+					# FIX: All assignments to target_allocations must be DataFrameRow
 					target_allocations = Dict{String, DataFrameRow}()
 
 					if forecast_result !== nothing
 						prism_a_weights_tall, prism_b_weights_tall = forecast_result
-						target_allocations["PRISM_A"] = pivot_allocations_to_row(prism_a_weights_tall, current_date)
-						target_allocations["PRISM_B"] = pivot_allocations_to_row(prism_b_weights_tall, current_date)
+						target_allocations["PRISM_A"] = pivot_allocations_to_row(prism_a_weights_tall, current_date)[1, :]
+						target_allocations["PRISM_B"] = pivot_allocations_to_row(prism_b_weights_tall, current_date)[1, :]
 					end
 
 					prices_slice_for_opt = filter(row -> row.Date < current_date, prices_weekly)
 					classical_results = run_classical_optimizations(prices_slice_for_opt, BENCHMARK, current_date)
 					for (name, weights) in classical_results
-						target_allocations[name] = weights
+						target_allocations[name] = weights[1, :]
 					end
 
 					hrp_results = run_hrp_optimizations(prices_slice_for_opt, BENCHMARK, current_date)
 					for (name, weights) in hrp_results
-						target_allocations[name] = weights
+						target_allocations[name] = weights[1, :]
 					end
 
 					if !isempty(tradable_stocks_in_period)
 						num_assets_ew = length(tradable_stocks_in_period)
 						ew_weights_df = DataFrame(Asset = tradable_stocks_in_period, Weight = fill(1.0 / num_assets_ew, num_assets_ew))
-						target_allocations["EqualWeight"] = pivot_allocations_to_row(ew_weights_df, current_date)
+						target_allocations["EqualWeight"] = pivot_allocations_to_row(ew_weights_df, current_date)[1, :]
 					else
-						target_allocations["EqualWeight"] = pivot_allocations_to_row(DataFrame(Asset = String[], Weight = Float64[]), current_date)
+						target_allocations["EqualWeight"] = pivot_allocations_to_row(DataFrame(Asset = String[], Weight = Float64[]), current_date)[1, :]
 					end
 
 					last_transaction_stats = Dict()
@@ -775,7 +819,9 @@ if RUN_MODE == :simulate
 						bnh_initialized = true
 						save_weights_to_csv(target_allocations["EqualWeight"], "BuyAndHold", WEIGHTS_DIR)
 					else
-						bnh_current_weights_row = get_current_weights_as_row(portfolios["BuyAndHold"], day_row, current_date)
+						# FIX: Ensure a DataFrameRow is passed here
+						bnh_current_weights_df = get_current_weights_as_row(portfolios["BuyAndHold"], day_row, current_date)
+						bnh_current_weights_row = bnh_current_weights_df[1, :]
 						save_weights_to_csv(bnh_current_weights_row, "BuyAndHold", WEIGHTS_DIR)
 					end
 
@@ -985,8 +1031,9 @@ if RUN_MODE == :analyze
 
 				if current_date in rebalance_dates
 					target_weights_tall = filter(r -> r.Date == current_date, weights_df)
-					target_weights_wide = pivot_allocations_to_row(target_weights_tall, current_date)
-					if length(target_weights_wide) > 1
+					target_weights_wide_df = pivot_allocations_to_row(target_weights_tall, current_date)
+					if nrow(target_weights_wide_df) > 0 && ncol(target_weights_wide_df) > 1
+						target_weights_wide = target_weights_wide_df[1, :]
 						rebalance_portfolio!(portfolio, target_weights_wide, day_row)
 					end
 				end
@@ -1319,16 +1366,23 @@ if RUN_MODE == :analyze
 			assets_for_ef = filter(c -> String(c) != "Date" && c in names(prices_df), names(prices_df))
 			ef_prices = prices_df[!, [:Date; Symbol.(assets_for_ef)]]
 
-			ef_returns_df = DataFrame(Date = ef_prices.Date[2:end])
+			ef_returns_df = DataFrame()
 			for col in assets_for_ef
-				ef_returns_df[!, col] = (ef_prices[2:end, col] ./ ef_prices[1:(end-1), col]) .- 1
+				prices = ef_prices[!, col]
+				log_returns = [NaN; log.(prices[2:end] ./ prices[1:(end-1)])]
+				ef_returns_df[!, col] = log_returns
 			end
 			ef_returns_matrix = Matrix(ef_returns_df[!, assets_for_ef])
 			ef_returns_matrix = coalesce.(ef_returns_matrix, 0.0)
 			ef_returns_matrix[.!isfinite.(ef_returns_matrix)] .= 0.0
 
 			μ_ann_historical = vec(mean(ef_returns_matrix, dims = 1) * 252)
-			Σ_ann = cov(ef_returns_matrix) * 252
+
+			# Use Ledoit-Wolf for a more stable covariance matrix, consistent with simulation
+			lw = sklearn_covariance.LedoitWolf()
+			lw.fit(ef_returns_matrix)
+			Σ_ann = convert(Matrix{Float64}, lw."covariance_") * 252
+
 			num_assets_ef = length(assets_for_ef)
 
 			p4 = plot(xlabel = "Annualized Volatility (%)", ylabel = "Annualized Return (%)",
