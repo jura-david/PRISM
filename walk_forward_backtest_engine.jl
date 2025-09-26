@@ -14,6 +14,7 @@ using CSV, DataFrames, Dates, Statistics, Random, Plots, Printf, ProgressMeter, 
 # :simulate - Runs the full, time-consuming backtest simulation to generate weights and stats.
 # :analyze  - Skips simulation and uses existing output files to generate all reports and plots.
 const RUN_MODE = :simulate
+const CLEAR_CHECKPOINTS_ON_COMPLETION = false # Set to true to clear all progress and checkpoints after a successful run.
 
 const BENCHMARK = "SPY"
 const TEST_MODE = false # Set to false to run the full backtest
@@ -107,20 +108,6 @@ function rebalance_portfolio!(portfolio::Portfolio, target_weights::DataFrameRow
 	return commission, turnover
 end
 
-function load_and_prepare_dividends(path::String)
-	println("--- Loading and preparing dividend data...")
-	try
-		dividends_wide = CSV.read(path, DataFrame; dateformat = "yyyy-mm-dd")
-		sort!(dividends_wide, :Date)
-		dividend_lookup = Dict(row.Date => row for row in eachrow(dividends_wide))
-		println("Dividend data loaded successfully.")
-		return dividend_lookup
-	catch e
-		println("WARNING: Could not load or process dividend file '$path'. Running without dividend adjustments. Error: $e")
-		return Dict{Date, DataFrameRow}()
-	end
-end
-
 function get_average_risk_free_rate(sim_start_date::Date)
 	BOND_YIELD_PATH = "/home/felhasznalo/Scrapers/Data/CSV/Bonds/Govies/Yields/Bond_Yields_10Y_US.csv"
 	try
@@ -156,7 +143,7 @@ end
 if RUN_MODE == :simulate
 
 	# --- Simulation-Only Helper Functions ---
-	function run_classical_optimizations(prices_slice::DataFrame, benchmark::String, target_date::Date)
+	function run_classical_optimizations(prices_slice::DataFrame, benchmark::String, target_date::Date, dividends_df::DataFrame, expense_ratios::Dict)
 		println("--- Running Classical Optimizations (Sharpe, MinVol, InvVol, MaxRet) ---")
 
 		stock_cols_initial = [col for col in names(prices_slice) if String(col) != benchmark && String(col) != "Date"]
@@ -177,9 +164,29 @@ if RUN_MODE == :simulate
 		returns_df = DataFrame()
 		for col in valid_stock_cols
 			prices = prices_slice[!, col]
-			log_returns = [NaN; log.(prices[2:end] ./ prices[1:(end-1)])]
-			# FIX: Robustly clean missing, NaN and Inf values from log returns
-			returns_df[!, col] = map(x -> (!ismissing(x) && isfinite(x)) ? x : 0.0, log_returns)
+			dates = prices_slice.Date
+			
+			weekly_expense = get(expense_ratios, col, 0.0) / 52.0
+
+			returns = fill(NaN, length(prices))
+			for i in 2:length(prices)
+				p_prev = prices[i-1]
+				p_curr = prices[i]
+				
+				dividend_sum = 0.0
+				if hasproperty(dividends_df, Symbol(col))
+					relevant_dividends = filter(row -> dates[i-1] < row.Date <= dates[i], dividends_df)
+					if !isempty(relevant_dividends)
+						dividend_sum = sum(coalesce.(relevant_dividends[:, Symbol(col)], 0.0))
+					end
+				end
+
+				if !ismissing(p_prev) && !ismissing(p_curr) && p_prev > 0
+					gross_return = (p_curr + dividend_sum) / p_prev
+					returns[i] = log(gross_return) - weekly_expense
+				end
+			end
+			returns_df[!, col] = map(x -> (!ismissing(x) && isfinite(x)) ? x : 0.0, returns)
 		end
 
 		returns_matrix = Matrix(returns_df)
@@ -487,7 +494,15 @@ if RUN_MODE == :simulate
 			return;
 		end
 
-		dividend_lookup = load_and_prepare_dividends(joinpath(DATA_DIR, "prices_dividends.csv"))
+		dividends_df = CSV.read(joinpath(DATA_DIR, "prices_dividends.csv"), DataFrame; dateformat = "yyyy-mm-dd", missingstring="NA")
+		sort!(dividends_df, :Date)
+		dividend_lookup = Dict(row.Date => row for row in eachrow(dividends_df))
+		println("Dividend data loaded successfully.")
+
+		println("--- Loading expense ratios... ---")
+		expenses_df = CSV.read(joinpath("Data", "etf_expenses.csv"), DataFrame)
+		expense_ratios = Dict(row.Ticker => row.ExpenseRatio_Percent for row in eachrow(expenses_df))
+		println("Expense ratios loaded.")
 
 		market_quarterly = CSV.read(joinpath(DATA_DIR, "market_quarterly.csv"), DataFrame; dateformat = "yyyy-mm-dd")
 		prices_weekly = CSV.read(joinpath(DATA_DIR, "prices_weekly.csv"), DataFrame; dateformat = "yyyy-mm-dd")
@@ -638,6 +653,8 @@ if RUN_MODE == :simulate
 		last_known_prices = Dict{String, Float64}()
 		all_stock_names = filter(name -> name != "Date", names(daily_prices))
 		last_transaction_stats = Dict{String, Any}()
+		period_dividends = Dict(name => 0.0 for name in keys(portfolios))
+        period_expenses = Dict(name => 0.0 for name in keys(portfolios))
 		bnh_initialized = false
 
 		for day_row in eachrow(filter(r -> sim_start_date <= r.Date <= sim_end_date, daily_prices))
@@ -651,7 +668,7 @@ if RUN_MODE == :simulate
 
 			if haskey(dividend_lookup, current_date)
 				dividend_row = dividend_lookup[current_date]
-				for portfolio in values(portfolios)
+				for (name, portfolio) in portfolios
 					dividend_cash_received = 0.0
 					for (stock, shares) in portfolio.positions
 						if hasproperty(dividend_row, Symbol(stock))
@@ -662,6 +679,7 @@ if RUN_MODE == :simulate
 						end
 					end
 					portfolio.cash += dividend_cash_received
+					period_dividends[name] += dividend_cash_received
 				end
 			end
 
@@ -786,7 +804,7 @@ if RUN_MODE == :simulate
 					end
 
 					prices_slice_for_opt = filter(row -> row.Date < current_date, prices_weekly)
-					classical_results = run_classical_optimizations(prices_slice_for_opt, BENCHMARK, current_date)
+					classical_results = run_classical_optimizations(prices_slice_for_opt, BENCHMARK, current_date, dividends_df, expense_ratios)
 					for (name, weights) in classical_results
 						target_allocations[name] = weights[1, :]
 					end
@@ -812,6 +830,15 @@ if RUN_MODE == :simulate
 							last_transaction_stats["$(name)_Turnover"] = turnover
 						end
 					end
+					
+					for name in keys(portfolios)
+                        last_transaction_stats["$(name)_Dividends"] = period_dividends[name]
+                        last_transaction_stats["$(name)_Expenses"] = period_expenses[name]
+                    end
+
+                    # Reset accumulators
+                    period_dividends = Dict(name => 0.0 for name in keys(portfolios))
+                    period_expenses = Dict(name => 0.0 for name in keys(portfolios))
 
 					if !bnh_initialized
 						println("--- Initializing Buy & Hold portfolio with equal weights ---")
@@ -848,6 +875,16 @@ if RUN_MODE == :simulate
 							price = ismissing(day_row[s]) ? get(last_known_prices, s, 0.0) : day_row[s]
 							get(portfolio.positions, s, 0.0) * price
 						end for s in keys(portfolio.positions); init = 0.0)
+					
+					daily_expense = 0.0
+                    for (stock, shares) in portfolio.positions
+                        price = ismissing(day_row[stock]) ? get(last_known_prices, stock, 0.0) : day_row[stock]
+                        position_value = shares * price
+                        daily_expense += position_value * (get(expense_ratios, stock, 0.0) / 252.0)
+                    end
+                    portfolio.cash -= daily_expense
+					period_expenses[name] += daily_expense
+
 					val = portfolio.cash + positions_value
 					push!(history_df, (Date = current_date, Value = val))
 				end
@@ -870,13 +907,16 @@ if RUN_MODE == :simulate
 
 		# 3. --- Final Reporting ---
 		finish!(prog)
-		if isfile(WF_PROGRESS_FILE)
-			;
-			rm(WF_PROGRESS_FILE);
-		end
-		if isdir(CHECKPOINTS_DIR)
-			;
-			rm(CHECKPOINTS_DIR, recursive = true, force = true);
+		if CLEAR_CHECKPOINTS_ON_COMPLETION
+			println("\n--- Clearing checkpoint and progress files as requested. ---")
+			if isfile(WF_PROGRESS_FILE)
+				rm(WF_PROGRESS_FILE)
+			end
+			if isdir(CHECKPOINTS_DIR)
+				rm(CHECKPOINTS_DIR, recursive = true, force = true)
+			end
+		else
+			println("\n--- Backtest complete. Checkpoints and progress have been preserved. ---")
 		end
 		println("\n--- Backtest complete. ---")
 	end
@@ -937,7 +977,10 @@ if RUN_MODE == :analyze
 			return
 		end
 
-		dividend_lookup = load_and_prepare_dividends(joinpath(DATA_DIR, "prices_dividends.csv"))
+		dividends_df = CSV.read(joinpath(DATA_DIR, "prices_dividends.csv"), DataFrame; dateformat = "yyyy-mm-dd", missingstring="NA")
+		sort!(dividends_df, :Date)
+		dividend_lookup = Dict(row.Date => row for row in eachrow(dividends_df))
+		println("Dividend data loaded successfully.")
 
 		# --- Define consistent color palette ---
 		strategy_colors = Dict(

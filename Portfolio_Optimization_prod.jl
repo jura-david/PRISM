@@ -17,7 +17,6 @@ using NOMAD
 using PlotlyJS
 using Plots
 using Printf
-using ProgressMeter
 using PyCall
 using Random
 using RollingFunctions
@@ -54,8 +53,10 @@ const FORECAST_PLOTS_DIR = joinpath("Plots", "Forecast")
 const CHECKPOINT_DIR = joinpath("Data", "Checkpoints")
 const EVAL_STATS_DIR = joinpath("Data", "EvalStats")
 const LOGS_DIR = "Logs"
-const STANDALONE_STATE_FILE = joinpath(LOGS_DIR, "standalone_pipeline_state.json")
-const STANDALONE_APSO_RESULTS = joinpath(CHECKPOINT_DIR, "standalone_apso_results.csv")
+const APSO_STATE_FILE = joinpath(LOGS_DIR, "apso_pipeline_state.json")
+const APSO_RESULTS_FILE = joinpath(CHECKPOINT_DIR, "precomputed_apso_results.csv")
+const TRANSACTION_BUY_COST = 0.005
+const TRANSACTION_SELL_COST = 0.005
 
 # === GLOBAL & DATA PARAMETERS ===
 const BENCHMARK = "SPY"
@@ -73,9 +74,8 @@ const APSO_W_DECAY = 3.0
 const APSO_C1_DECAY = 3.0
 const APSO_C2_INCREASE = 1.0
 const APSO_PARETO_PENALTIES = 0.0:0.1:1.0
+const APSO_RISK_PENALTIES = 0.0:0.5:5.0
 const APSO_MAX_REFINEMENT_ATTEMPTS = 20
-const APSO_MU_INITIAL = 0.1
-const APSO_MU_INCREMENT = 0.15
 
 # === STAGE 2: FEATURE ENGINEERING PARAMETERS ===
 # --- Time Series ---
@@ -169,17 +169,20 @@ function calculate_transaction_cost(current_weights::Vector, previous_weights::V
 	return (buys * buy_cost) + (sells * sell_cost)
 end
 
-function portfolio_objective_function(weights::Vector, log_returns, benchmark_log_returns, shrunk_cov_matrix, mu, diversification_penalty, previous_weights, num_stocks)
+function portfolio_objective_function(weights::Vector, log_returns, benchmark_log_returns, shrunk_cov_matrix, risk_penalty, hhi_penalty, previous_weights, num_stocks)
 	gross_portfolio_return = calculate_quarterly_return(log_returns, weights)
 	turnover_cost = calculate_transaction_cost(weights, previous_weights)
 	net_portfolio_return = gross_portfolio_return - turnover_cost
 	benchmark_return = exp(sum(benchmark_log_returns)) - 1
 	excess_return = net_portfolio_return - benchmark_return
 	tracking_error = calculate_shrunk_tracking_error(weights, shrunk_cov_matrix)
+
 	hhi = sum((weights ./ 100.0) .^ 2)
 	hhi_normalized = num_stocks > 1 ? (hhi - (1 / num_stocks)) / (1 - (1 / num_stocks)) : 1.0
-	hhi_penalty = hhi_normalized
-	cost = -excess_return + mu * tracking_error + diversification_penalty * hhi_penalty
+
+	# The cost is a weighted sum of the three objectives we want to optimize.
+	# We want to MINIMIZE cost, so we maximize excess return (-excess_return) and minimize the penalties.
+	cost = -excess_return + risk_penalty * tracking_error + hhi_penalty * hhi_normalized
 	return cost
 end
 
@@ -229,14 +232,15 @@ function winsorize_series(series::Vector; lower_percentile = 1, upper_percentile
 end
 
 function create_pso_objective_function(log_returns_quarterly_slice, benchmark_log_returns_quarterly_slice,
-	shrunk_cov_matrix, num_stocks; mu = 1.0, diversification_penalty = 0.1, previous_weights = nothing)
+	shrunk_cov_matrix, num_stocks; risk_penalty = 1.0, hhi_penalty = 0.1, previous_weights = nothing)
 	function pso_objective(particles)
 		costs = zeros(size(particles, 1))
 		for (i, p_py) in enumerate(eachrow(particles))
 			p = convert(Vector{Float64}, p_py)
 			abs_sum = sum(abs.(p))
 			weights = abs_sum > 0 ? (p ./ abs_sum) .* 100.0 : zeros(length(p))
-			costs[i] = portfolio_objective_function(weights, log_returns_quarterly_slice, benchmark_log_returns_quarterly_slice, shrunk_cov_matrix, mu, diversification_penalty, previous_weights, num_stocks)
+			# Pass the new penalties to the core objective function
+			costs[i] = portfolio_objective_function(weights, log_returns_quarterly_slice, benchmark_log_returns_quarterly_slice, shrunk_cov_matrix, risk_penalty, hhi_penalty, previous_weights, num_stocks)
 		end
 		return costs
 	end
@@ -350,6 +354,10 @@ function run_apso_stage(market_quarterly, prices_weekly;
 	diversification_penalty_grid, benchmark,
 	state_file_path = nothing, output_csv_path = nothing)
 
+	# --- Use provided paths or fall back to global constants ---
+	current_state_file = (state_file_path !== nothing) ? state_file_path : APSO_STATE_FILE
+	current_output_csv = (output_csv_path !== nothing) ? output_csv_path : APSO_RESULTS_FILE
+
 	# --- Initial Data Prep ---
 	if isempty(prices_weekly) || isempty(market_quarterly)
 		return nothing, nothing, 0, 0
@@ -360,6 +368,14 @@ function run_apso_stage(market_quarterly, prices_weekly;
 	if !(eltype(market_quarterly.Date) <: Date)
 		market_quarterly.Date = Date.(market_quarterly.Date)
 	end
+
+	# --- Load expense and dividend data ---
+	expenses_df = CSV.read(joinpath("Data", "etf_expenses.csv"), DataFrame)
+	dividends_df = CSV.read(joinpath("Data", "prices_dividends.csv"), DataFrame)
+	if "Date" in names(dividends_df) && !(eltype(dividends_df.Date) <: Date)
+		dividends_df.Date = Date.(dividends_df.Date)
+	end
+	expense_ratios = Dict(row.Ticker => row.ExpenseRatio_Percent for row in eachrow(expenses_df))
 
 	benchmark_col_name = benchmark
 	if benchmark_col_name ∉ names(prices_weekly)
@@ -372,14 +388,14 @@ function run_apso_stage(market_quarterly, prices_weekly;
 	end
 
 	all_results_df, all_pareto_results_df = DataFrame(), DataFrame()
-	quarters_to_process = unique(firstdayofquarter.(market_quarterly.Date))
+	all_quarters = unique(firstdayofquarter.(market_quarterly.Date))
+	total_quarters = length(all_quarters)
+	quarters_to_process = all_quarters  # Start with all, filter after checking state
 	last_completed_quarter = Date(1900, 1, 1)
 	local state = Dict()
 	apso_loop_executed = false
 
 	# --- Resumability Logic ---
-	current_state_file = BACKTEST_MODE ? state_file_path : STANDALONE_STATE_FILE
-	current_output_csv = BACKTEST_MODE ? output_csv_path : STANDALONE_APSO_RESULTS
 	pareto_checkpoint_path = joinpath(CHECKPOINT_DIR, "apso_pareto_quarterly_stats.csv")
 
 	if current_state_file !== nothing && current_output_csv !== nothing
@@ -398,11 +414,18 @@ function run_apso_stage(market_quarterly, prices_weekly;
 			all_pareto_results_df.Date = Date.(all_pareto_results_df.Date)
 		end
 
-		quarters_to_process = filter(q -> q > last_completed_quarter, quarters_to_process)
+		quarters_to_process = filter(q -> q > last_completed_quarter, all_quarters)
 		if !isempty(all_results_df) && last_completed_quarter > Date(1900, 1, 1)
 			println("--- Resuming from quarter: $(isempty(quarters_to_process) ? "N/A" : first(quarters_to_process)) ---")
 		end
 	end
+
+	completed_quarters_count = total_quarters - length(quarters_to_process)
+
+	println("DEBUG: About to create progress bar.")
+	println("DEBUG: total_quarters = ", total_quarters)
+	println("DEBUG: completed_quarters_count = ", completed_quarters_count)
+	println("DEBUG: quarters_to_process length = ", length(quarters_to_process))
 
 	# --- Main Loop Setup ---
 	MIN_WEEKLY_OBSERVATIONS_PER_QUARTER = 10
@@ -421,10 +444,11 @@ function run_apso_stage(market_quarterly, prices_weekly;
 		end
 	end
 
-	prog = Progress(length(quarters_to_process), "APSO Pareto Calculation:")
+	
+
 	for (i, quarter_start) in enumerate(quarters_to_process)
 		apso_loop_executed = true
-		ProgressMeter.update!(prog, i, showvalues = [(:quarter, quarter_start)])
+		
 
 		quarter_end = lastdayofquarter(quarter_start)
 		prices_in_quarter = filter(row -> quarter_start <= row.Date <= quarter_end, prices_weekly)
@@ -438,22 +462,74 @@ function run_apso_stage(market_quarterly, prices_weekly;
 			optimal_weights_df.Date = [quarter_start]
 			ir_df = DataFrame(Date = [quarter_start], Information_Ratio = [0.0])
 			ci_df = DataFrame(Date = [quarter_start], IR_CI_Lower = [0.0], IR_CI_Upper = [0.0])
-			current_quarter_result = innerjoin(ir_df, optimal_weights_df, ci_df, on = :Date)
+
+			# Correctly join DataFrames
+			current_quarter_result = innerjoin(ir_df, optimal_weights_df, on = :Date)
+			current_quarter_result = innerjoin(current_quarter_result, ci_df, on = :Date)
+
 			market_data_for_join = filter(row -> row.Date == quarter_start, select(market_quarterly, Not(r"_Weight$")))
 			if !isempty(market_data_for_join)
 				current_quarter_result = innerjoin(market_data_for_join, current_quarter_result, on = :Date)
 			end
 
-			blank_pareto_df = DataFrame(Date = quarter_start, Penalty = 0.0, IR = 0.0, HHI = 0.0, CI_Lower = 0.0, CI_Upper = 0.0)
+			blank_pareto_df = DataFrame(Date = quarter_start, Risk_Penalty = 0.0, HHI_Penalty = 0.0, IR = 0.0, HHI = 0.0, Tracking_Error = 0.0, CI_Lower = 0.0, CI_Upper = 0.0)
 			save_state_and_results(current_quarter_result, blank_pareto_df, quarter_start)
 			println("--- APSO quarter for $(quarter_start) complete. Exiting with code $(RESTART_AFTER_QUARTER_EXIT_CODE) to signal restart. ---")
 			exit(RESTART_AFTER_QUARTER_EXIT_CODE)
 		end
 
-		log_ret(p) = [NaN; log.(p[2:end] ./ p[1:(end-1)])]
 		clean_val(x) = !isfinite(x) ? 0.0 : x
-		stock_returns_quarter = DataFrame([col => winsorize_series(clean_val.(log_ret(coalesce.(prices_in_quarter[:, Symbol(col)], NaN)))) for col in tradable_stocks_in_quarter])
-		benchmark_log_returns_in_quarter = winsorize_series(clean_val.(log_ret(coalesce.(prices_in_quarter[:, Symbol(benchmark_col_name)], NaN))))
+		stock_returns_quarter = DataFrame()
+        for col in tradable_stocks_in_quarter
+            prices = coalesce.(prices_in_quarter[:, Symbol(col)], NaN)
+            dates = prices_in_quarter.Date
+            
+            weekly_expense = get(expense_ratios, col, 0.0) / 52.0
+            
+            returns = fill(NaN, length(prices))
+            for i in 2:length(prices)
+                p_prev = prices[i-1]
+                p_curr = prices[i]
+                
+                dividend_sum = 0.0
+                if hasproperty(dividends_df, Symbol(col))
+                    relevant_dividends = filter(row -> dates[i-1] < row.Date <= dates[i], dividends_df)
+                    if !isempty(relevant_dividends) && !all(ismissing, relevant_dividends[:, Symbol(col)])
+                        dividend_sum = sum(coalesce.(relevant_dividends[:, Symbol(col)], 0.0))
+                    end
+                end
+
+                if !ismissing(p_prev) && !ismissing(p_curr) && p_prev > 0
+                    gross_return = (p_curr + dividend_sum) / p_prev
+                    returns[i] = log(gross_return) - weekly_expense
+                end
+            end
+            stock_returns_quarter[!, Symbol(col)] = winsorize_series(clean_val.(returns))
+        end
+
+		benchmark_prices = coalesce.(prices_in_quarter[:, Symbol(benchmark_col_name)], NaN)
+        benchmark_dates = prices_in_quarter.Date
+        benchmark_weekly_expense = get(expense_ratios, benchmark_col_name, 0.0) / 52.0
+        
+        benchmark_returns = fill(NaN, length(benchmark_prices))
+        for i in 2:length(benchmark_prices)
+            p_prev = benchmark_prices[i-1]
+            p_curr = benchmark_prices[i]
+            
+            dividend_sum = 0.0
+            if hasproperty(dividends_df, Symbol(benchmark_col_name))
+                relevant_dividends = filter(row -> benchmark_dates[i-1] < row.Date <= benchmark_dates[i], dividends_df)
+                if !isempty(relevant_dividends) && !all(ismissing, relevant_dividends[:, Symbol(benchmark_col_name)])
+                    dividend_sum = sum(coalesce.(relevant_dividends[:, Symbol(benchmark_col_name)], 0.0))
+                end
+            end
+
+            if !ismissing(p_prev) && !ismissing(p_curr) && p_prev > 0
+                gross_return = (p_curr + dividend_sum) / p_prev
+                benchmark_returns[i] = log(gross_return) - benchmark_weekly_expense
+            end
+        end
+        benchmark_log_returns_in_quarter = winsorize_series(clean_val.(benchmark_returns))
 		log_returns_in_quarter = Matrix(stock_returns_quarter)
 		num_stocks = size(log_returns_in_quarter, 2)
 
@@ -466,55 +542,80 @@ function run_apso_stage(market_quarterly, prices_weekly;
 		quarterly_shrunk_cov_matrix = convert(Matrix{Float64}, lw."covariance_")
 
 		quarterly_pareto_results = []
-		for penalty_val in diversification_penalty_grid
-			mu_val = APSO_MU_INITIAL
-			best_fallback_solution = Dict("weights" => zeros(num_stocks), "ir" => 0.0, "ci" => (-Inf, -Inf))
-			for attempt in 1:APSO_MAX_REFINEMENT_ATTEMPTS
-				try
-					pso_bounds = (fill(-1.0, num_stocks), fill(1.0, num_stocks))
-					pso_objective_func =
-						create_pso_objective_function(log_returns_in_quarter, benchmark_log_returns_in_quarter, quarterly_shrunk_cov_matrix, num_stocks; mu = mu_val, diversification_penalty = penalty_val, previous_weights = aligned_previous_weights)
 
-					pso_best_solution, pso_final_costs, pso_cost_histories = multi_start_pso(pso_objective_func, pso_bounds, set_particles, num_stocks, set_iters_pso, set_starts, pso_w_decay_rate, pso_c1_decay_rate, pso_c2_increase_rate)
+		# --- Nested loop for 3D Pareto Frontier ---
+		# We now iterate over both risk and HHI penalties to build a 3D surface.
+		for risk_penalty_val in APSO_RISK_PENALTIES
+			for hhi_penalty_val in diversification_penalty_grid
+				try
+					# --- PSO objective now takes both penalties directly ---
+					pso_objective_func = create_pso_objective_function(
+						log_returns_in_quarter, benchmark_log_returns_in_quarter,
+						quarterly_shrunk_cov_matrix, num_stocks;
+						risk_penalty = risk_penalty_val,
+						hhi_penalty = hhi_penalty_val,
+						previous_weights = aligned_previous_weights,
+					)
+
+					pso_best_solution, pso_final_costs, pso_cost_histories = multi_start_pso(
+						pso_objective_func, (fill(-1.0, num_stocks), fill(1.0, num_stocks)),
+						set_particles, num_stocks, set_iters_pso, set_starts,
+						pso_w_decay_rate, pso_c1_decay_rate, pso_c2_increase_rate,
+					)
 					append!(plot_data_aggregator["all_costs"], pso_final_costs)
 					append!(plot_data_aggregator["all_histories"], pso_cost_histories)
 
 					x0_sum = sum(abs.(pso_best_solution))
 					x0 = x0_sum > 0 ? (pso_best_solution ./ x0_sum) .* 100.0 : zeros(num_stocks)
-					slsqp_bounds = [(-100.0, 100.0) for _ in 1:num_stocks]
-					constraints = py"dict"(type = "eq", fun = (w -> sum(abs.(w)) - 100.0))
-					options_slsqp = py"dict"(disp = false, ftol = 1e-9, maxiter = 200)
-					scipy_obj_wrapper(w) = portfolio_objective_function(convert(Vector{Float64}, w), log_returns_in_quarter, benchmark_log_returns_in_quarter, quarterly_shrunk_cov_matrix, mu_val, penalty_val, aligned_previous_weights, num_stocks)
-					slsqp_result = sp.optimize.minimize(scipy_obj_wrapper, x0; method = "SLSQP", bounds = slsqp_bounds, constraints = constraints, options = options_slsqp)
+
+					# --- SciPy wrapper passes both penalties ---
+					scipy_obj_wrapper(w) = portfolio_objective_function(
+						convert(Vector{Float64}, w), log_returns_in_quarter,
+						benchmark_log_returns_in_quarter, quarterly_shrunk_cov_matrix,
+						risk_penalty_val, hhi_penalty_val,
+						aligned_previous_weights, num_stocks,
+					)
+
+					slsqp_result = sp.optimize.minimize(
+						scipy_obj_wrapper, x0; method = "SLSQP",
+						bounds = [(-100.0, 100.0) for _ in 1:num_stocks],
+						constraints = py"dict"(type = "eq", fun = (w -> sum(abs.(w)) - 100.0)),
+						options = py"dict"(disp = false, ftol = 1e-9, maxiter = 200),
+					)
 					final_optimal_weights_unrounded = slsqp_result["success"] ? convert(Vector{Float64}, slsqp_result["x"]) : x0
 
+					# --- Calculate all metrics for this point on the Pareto surface ---
 					bootstrap_ir_samples = perform_bootstrap_analysis_on_weights(log_returns_in_quarter, benchmark_log_returns_in_quarter, final_optimal_weights_unrounded, n_bootstrap_samples)
+					append!(plot_data_aggregator["all_bootstrap_samples"], bootstrap_ir_samples)
 
 					ci_lower, ci_upper = percentile(bootstrap_ir_samples, [2.5, 97.5])
 					gross_port_return = calculate_quarterly_return(log_returns_in_quarter, final_optimal_weights_unrounded)
 					bench_return = exp(sum(benchmark_log_returns_in_quarter)) - 1
 					track_error = calculate_shrunk_tracking_error(final_optimal_weights_unrounded, quarterly_shrunk_cov_matrix)
 					information_ratio = track_error > 1e-8 ? (gross_port_return - bench_return) / track_error : 0.0
-					if ci_lower > best_fallback_solution["ci"][1]
-						best_fallback_solution = Dict("weights" => final_optimal_weights_unrounded, "ir" => information_ratio, "ci" => (ci_lower, ci_upper))
-					end
-					if ci_lower > 0
-						append!(plot_data_aggregator["all_bootstrap_samples"], bootstrap_ir_samples)
-						break
-					end
-					mu_val += APSO_MU_INCREMENT
+					hhi = sum((final_optimal_weights_unrounded ./ 100.0) .^ 2)
+
+					# --- Store results with both penalties and tracking error ---
+					push!(
+						quarterly_pareto_results,
+						Dict(
+							"Date" => quarter_start,
+							"Risk_Penalty" => risk_penalty_val,
+							"HHI_Penalty" => hhi_penalty_val,
+							"IR" => information_ratio,
+							"HHI" => hhi,
+							"Tracking_Error" => track_error,
+							"CI_Lower" => ci_lower,
+							"CI_Upper" => ci_upper,
+							"Weights" => final_optimal_weights_unrounded,
+						),
+					)
 				catch e
-					println("CRITICAL ERROR in APSO for quarter $(quarter_start): $e")
+					println("CRITICAL ERROR in APSO for quarter $(quarter_start) with penalties (Risk: $risk_penalty_val, HHI: $hhi_penalty_val): $e")
 					continue
 				end
-			end
-			final_weights_unrounded_for_penalty = best_fallback_solution["weights"]
-			hhi = sum((final_weights_unrounded_for_penalty ./ 100.0) .^ 2)
-			push!(
-				quarterly_pareto_results,
-				Dict("Date"=>quarter_start, "Penalty"=>penalty_val, "IR"=>best_fallback_solution["ir"], "HHI"=>hhi, "CI_Lower"=>best_fallback_solution["ci"][1], "CI_Upper"=>best_fallback_solution["ci"][2], "Weights"=>final_weights_unrounded_for_penalty),
-			)
-		end
+			end # end HHI penalty loop
+		end # end Risk penalty loop
 
 		if isempty(quarterly_pareto_results)
 			println("WARNING: No valid Pareto results for quarter $(quarter_start). Saving blank and restarting.")
@@ -543,21 +644,29 @@ function run_apso_stage(market_quarterly, prices_weekly;
 		optimal_weights_df.Date = [quarter_start]
 		ir_df = DataFrame(Date = [quarter_start], Information_Ratio = [final_ir])
 		ci_df = DataFrame(Date = [quarter_start], IR_CI_Lower = [final_ci[1]], IR_CI_Upper = [final_ci[2]])
+
 		current_quarter_result = innerjoin(ir_df, optimal_weights_df, on = :Date)
+		current_quarter_result = innerjoin(current_quarter_result, ci_df, on = :Date)
+
 		market_data_for_join = filter(row -> row.Date == quarter_start, select(market_quarterly, Not(r"_Weight$")))
 		if !isempty(market_data_for_join)
 			current_quarter_result = innerjoin(market_data_for_join, current_quarter_result, on = :Date)
 		end
-		current_quarter_result = innerjoin(current_quarter_result, ci_df, on = :Date)
 
-		current_pareto_df = DataFrame(
-			Date = [res["Date"] for res in quarterly_pareto_results],
-			Penalty = [res["Penalty"] for res in quarterly_pareto_results],
-			IR = [res["IR"] for res in quarterly_pareto_results],
-			HHI = [res["HHI"] for res in quarterly_pareto_results],
-			CI_Lower = [res["CI_Lower"] for res in quarterly_pareto_results],
-			CI_Upper = [res["CI_Upper"] for res in quarterly_pareto_results],
-		)
+		current_pareto_df = if !isempty(quarterly_pareto_results)
+			DataFrame(
+				Date = [res["Date"] for res in quarterly_pareto_results],
+				Risk_Penalty = [res["Risk_Penalty"] for res in quarterly_pareto_results],
+				HHI_Penalty = [res["HHI_Penalty"] for res in quarterly_pareto_results],
+				IR = [res["IR"] for res in quarterly_pareto_results],
+				HHI = [res["HHI"] for res in quarterly_pareto_results],
+				Tracking_Error = [res["Tracking_Error"] for res in quarterly_pareto_results],
+				CI_Lower = [res["CI_Lower"] for res in quarterly_pareto_results],
+				CI_Upper = [res["CI_Upper"] for res in quarterly_pareto_results],
+			)
+		else
+			DataFrame()
+		end
 
 		all_results_df = vcat(all_results_df, current_quarter_result)
 		all_pareto_results_df = vcat(all_pareto_results_df, current_pareto_df)
@@ -566,29 +675,64 @@ function run_apso_stage(market_quarterly, prices_weekly;
 		println("--- APSO quarter for $(quarter_start) complete. Exiting with code $(RESTART_AFTER_QUARTER_EXIT_CODE) to signal restart. ---")
 		exit(RESTART_AFTER_QUARTER_EXIT_CODE)
 	end
-	ProgressMeter.finish!(prog)
+	
 
 	if ENABLE_PLOTTING && !isempty(all_results_df) && apso_loop_executed
 		println("\n", "="^25, " GENERATING AND SAVING APSO PLOTS ", "="^25)
 		plot_dir = joinpath(pwd(), "Plots", "APSO")
 		mkpath(plot_dir)
-		if !isempty(all_pareto_results_df)
-			avg_pareto = combine(groupby(all_pareto_results_df, :Penalty), :CI_Lower => mean => :Avg_CI_Lower, :HHI => mean => :Avg_HHI)
-			sort!(avg_pareto, :Penalty)
-			frontier_df = DataFrame(Penalty = Float64[], Avg_CI_Lower = Float64[], Avg_HHI = Float64[])
-			max_ci_so_far = -Inf
-			for row in eachrow(avg_pareto)
-				if row.Avg_CI_Lower > max_ci_so_far
-					push!(frontier_df, row)
-					max_ci_so_far = row.Avg_CI_Lower
-				end
+
+		# --- Generate and save the new 3D Pareto plot ---
+		if !isempty(all_pareto_results_df) && all(hasproperty(all_pareto_results_df, c) for c in [:Risk_Penalty, :HHI_Penalty, :CI_Lower, :HHI, :Tracking_Error])
+			# Aggregate results across all quarters to find the average Pareto surface
+			avg_pareto_3d = combine(groupby(all_pareto_results_df, [:Risk_Penalty, :HHI_Penalty]),
+				:CI_Lower => mean => :Avg_CI_Lower,
+				:HHI => mean => :Avg_HHI,
+				:Tracking_Error => mean => :Avg_Tracking_Error)
+
+			# Filter for the actual frontier (non-dominated points)
+			frontier_points_3d = DataFrame()
+			for group in groupby(avg_pareto_3d, :Avg_Tracking_Error)
+				# For a given level of risk, find the point that is not dominated by another in terms of HHI and Return
+				non_dominated = filter(row -> !any((other.Avg_HHI <= row.Avg_HHI && other.Avg_CI_Lower >= row.Avg_CI_Lower) && (other.Avg_HHI < row.Avg_HHI || other.Avg_CI_Lower > row.Avg_CI_Lower) for other in eachrow(group)), group)
+				append!(frontier_points_3d, non_dominated)
 			end
-			p_pareto = plot(frontier_df.Avg_HHI, frontier_df.Avg_CI_Lower, title = "Average Pareto Frontier", xlabel = "Average HHI", ylabel = "Average Lower CI Bound", legend = false, lw = 3, marker = :circle)
-			scatter!(p_pareto, avg_pareto.Avg_HHI, avg_pareto.Avg_CI_Lower, color = :grey, alpha = 0.6, marker = :x)
-			hline!(p_pareto, [0], lw = 1.5, ls = :dash, color = :red)
-			savefig(p_pareto, joinpath(plot_dir, "average_pareto_frontier.png"))
-			println("Saved average Pareto frontier plot.")
+
+			println("Generating 3D Pareto Frontier plot...")
+			# Use PlotlyJS for an interactive 3D scatter plot
+			trace = scatter3d(
+				x = frontier_points_3d.Avg_Tracking_Error,
+				y = frontier_points_3d.Avg_HHI,
+				z = frontier_points_3d.Avg_CI_Lower,
+				mode = "markers",
+				marker = Dict(
+					"size" => 6,
+					"color" => frontier_points_3d.Avg_CI_Lower,
+					"colorscale" => "Viridis",
+					"colorbar" => Dict("title" => "Avg Lower CI (Return)"),
+					"showscale" => true,
+					"opacity" => 0.8,
+				),
+			)
+
+			layout = Layout(
+				title = "3D Pareto Frontier (Risk vs. Diversification vs. Return)",
+				scene = attr(
+					xaxis_title = "Average Tracking Error (Risk)",
+					yaxis_title = "Average HHI (Concentration)",
+					zaxis_title = "Average Lower CI Bound (Return)",
+				),
+				margin = attr(l = 0, r = 0, b = 0, t = 40),
+			)
+
+			p_pareto_3d = PlotlyJS.plot(trace, layout)
+
+			# Save as both an interactive HTML and a static image
+			savefig(p_pareto_3d, joinpath(plot_dir, "average_pareto_frontier_3d.html"))
+			savefig(p_pareto_3d, joinpath(plot_dir, "average_pareto_frontier_3d.png"))
+			println("Saved 3D Pareto frontier plot as HTML and PNG.")
 		end
+
 		weight_columns = [col for col in names(all_results_df) if endswith(string(col), "_Weight")]
 		weights_only_df = all_results_df[:, weight_columns]
 		plot_df = Matrix(weights_only_df)
@@ -690,6 +834,7 @@ function run_apso_stage(market_quarterly, prices_weekly;
 			get_stats(successful_results.CI_Upper, "IR_CI_Upper_Successful"),
 			get_stats(unsuccessful_results.CI_Upper, "IR_CI_Upper_Unsuccessful"),
 			get_stats(all_pareto_results_df.HHI, "HHI_All"),
+			get_stats(all_pareto_results_df.Tracking_Error, "TrackingError_All"), # Added TE stats
 		)
 		mkpath(EVAL_STATS_DIR)
 		stats_path = joinpath(EVAL_STATS_DIR, "apso_summary_stats.csv")
@@ -1282,7 +1427,7 @@ end
 Creates an interactive 3D plot of the Pareto frontier results.
 """
 function plot_pareto_frontier(pareto_results)
-	println("\n--- Generating 3D Interactive Pareto Frontier Plot ---")
+	println("\n--- GENERATING 3D INTERACTIVE PARETO FRONTIER PLOT ---")
 
 	# Extract data for plotting
 	risks = [res.risk for res in pareto_results]
@@ -1585,7 +1730,7 @@ function run_forecasting_stage(final_features_df::DataFrame, prices_weekly_df::D
 		println("Generated a Pareto grid with $(length(pareto_grid)) preference combinations.")
 		pareto_results = []
 
-		prog = Progress(length(pareto_grid), "Evaluating Pareto Grid:")
+		
 		for prefs in pareto_grid
 			lower_bounds, upper_bounds, x0 = [0.01, 0.01, 0.01], [5.0, 5.0, 5.0], [0.5, 0.5, 0.5]
 			# Reduce NOMAD evaluations per point to manage total runtime
@@ -1622,7 +1767,7 @@ function run_forecasting_stage(final_features_df::DataFrame, prices_weekly_df::D
 				hhi = sum(optimal_weights .^ 2)
 				push!(pareto_results, (ir = predicted_ir, risk = risk, hhi = hhi, prefs = prefs, hyperparams = current_best_hyperparams))
 			end
-			next!(prog)
+
 		end
 
 		if isempty(pareto_results)
@@ -1651,7 +1796,7 @@ function run_forecasting_stage(final_features_df::DataFrame, prices_weekly_df::D
 
 	println("\n--- Stage 3.7B: Bootstrapping ---")
 	bootstrap_weights_matrix = Matrix{Float64}(undef, length(tradable_universe), n_bootstrap)
-	prog = Progress(n_bootstrap, "Running Bootstrap Simulations:")
+	
 	for i in 1:n_bootstrap
 		bootstrap_indices = rand(1:nrow(X_interactive), nrow(X_interactive))
 		X_sample = X_interactive[bootstrap_indices, :]
@@ -1692,7 +1837,7 @@ function run_forecasting_stage(final_features_df::DataFrame, prices_weekly_df::D
 		else
 			bootstrap_weights_matrix[:, i] .= NaN
 		end
-		next!(prog)
+		
 	end
 
 	clean_weights = copy(bootstrap_weights_matrix)
@@ -1917,19 +2062,36 @@ function main()
 	println("\nForecast quarter data prepared and appended for feature transformation.")
 
 	# --- Stage 2: Run Feature Engineering ---
-	final_features_df = run_feature_engineering_stage(
-		data_for_fe;
-		lag_vals = FE_FEATURE_LAGS,
-		target_lag_vals = FE_TARGET_LAGS,
-		window_vals = FE_ROLLING_WINDOWS,
-		mi_std_multiplier = FE_MI_THRESHOLD_STD_MULTIPLIER,
-		mi_fallback_n = FE_MI_FALLBACK_N_FEATURES,
-		poly_degree = FE_POLYNOMIAL_DEGREE,
-		sulov_corr_thresh = FE_SULOV_CORR_THRESHOLD,
-		optuna_trials = FE_OPTUNA_TRIALS,
-		sulov_plot_seed_nodes = FE_SULOV_PLOT_SEED_NODES,
-		sulov_plot_k_neighbors = FE_SULOV_PLOT_K_NEIGHBORS,
-	)
+	local final_features_df
+	fe_checkpoint_path = joinpath(CHECKPOINT_DIR, "FE_$(last_quarter_date).csv")
+	mkpath(CHECKPOINT_DIR) # Ensure directory exists
+
+	if isfile(fe_checkpoint_path)
+		println("\n--- Loading cached Feature Engineering results for $(last_quarter_date)...")
+		final_features_df = CSV.read(fe_checkpoint_path, DataFrame)
+		if "Date" in names(final_features_df) && !(eltype(final_features_df.Date) <: Date)
+			final_features_df.Date = Date.(final_features_df.Date)
+		end
+	else
+		println("\n--- Running Feature Engineering for $(last_quarter_date)...")
+		final_features_df = run_feature_engineering_stage(
+			data_for_fe;
+			lag_vals = FE_FEATURE_LAGS,
+			target_lag_vals = FE_TARGET_LAGS,
+			window_vals = FE_ROLLING_WINDOWS,
+			mi_std_multiplier = FE_MI_THRESHOLD_STD_MULTIPLIER,
+			mi_fallback_n = FE_MI_FALLBACK_N_FEATURES,
+			poly_degree = FE_POLYNOMIAL_DEGREE,
+			sulov_corr_thresh = FE_SULOV_CORR_THRESHOLD,
+			optuna_trials = FE_OPTUNA_TRIALS,
+			sulov_plot_seed_nodes = FE_SULOV_PLOT_SEED_NODES,
+			sulov_plot_k_neighbors = FE_SULOV_PLOT_K_NEIGHBORS,
+		)
+		if final_features_df !== nothing
+			println("--- Caching Feature Engineering results for $(last_quarter_date)...")
+			CSV.write(fe_checkpoint_path, final_features_df)
+		end
+	end
 
 	if final_features_df === nothing
 		println("Feature Engineering stage failed to produce results. Halting pipeline.")
@@ -1941,24 +2103,43 @@ function main()
 	println("\n--- RUN MODE: STANDARD ---")
 	println("P&L constraint is not applied.")
 
-	average_weights_df = run_forecasting_stage(
-		final_features_df,
-		prices_weekly; # Pass the full weekly prices for covariance calculation
-		pca_variance_threshold = FC_PCA_VARIANCE_THRESHOLD,
-		ridge_alpha_start = FC_RIDGE_ALPHA_START,
-		ridge_alpha_end = FC_RIDGE_ALPHA_END,
-		ridge_alpha_count = FC_RIDGE_ALPHA_COUNT,
-		ridge_cv_folds = FC_RIDGE_CV_FOLDS,
-		nomad_max_evals = FC_NOMAD_MAX_EVALS,
-		n_bootstrap = FC_BOOTSTRAP_SAMPLES,
-		benchmark = BENCHMARK,
-	)
+	local final_weights_df, bootstrap_weights_df
+	fc_prism_a_path = joinpath(CHECKPOINT_DIR, "FC_PRISM_A_$(last_quarter_date).csv")
+	fc_prism_b_path = joinpath(CHECKPOINT_DIR, "FC_PRISM_B_$(last_quarter_date).csv")
+	mkpath(CHECKPOINT_DIR)
+
+	if isfile(fc_prism_a_path) && isfile(fc_prism_b_path)
+		println("--- Loading cached Forecasting results for $(last_quarter_date)...")
+		final_weights_df = CSV.read(fc_prism_a_path, DataFrame)
+		bootstrap_weights_df = CSV.read(fc_prism_b_path, DataFrame)
+	else
+		println("--- Running Forecasting for $(last_quarter_date)...")
+		final_weights_df, bootstrap_weights_df = run_forecasting_stage(
+			final_features_df,
+			prices_weekly; # Pass the full weekly prices for covariance calculation
+			pca_variance_threshold = FC_PCA_VARIANCE_THRESHOLD,
+			ridge_alpha_start = FC_RIDGE_ALPHA_START,
+			ridge_alpha_end = FC_RIDGE_ALPHA_END,
+			ridge_alpha_count = FC_RIDGE_ALPHA_COUNT,
+			ridge_cv_folds = FC_RIDGE_CV_FOLDS,
+			nomad_max_evals = FC_NOMAD_MAX_EVALS,
+			n_bootstrap = FC_BOOTSTRAP_SAMPLES,
+			benchmark = BENCHMARK,
+			tradable_universe = stock_cols,
+		)
+
+		if final_weights_df !== nothing && bootstrap_weights_df !== nothing
+			println("--- Caching Forecasting results for $(last_quarter_date)...")
+			CSV.write(fc_prism_a_path, final_weights_df)
+			CSV.write(fc_prism_b_path, bootstrap_weights_df)
+		end
+	end
 
 	println("\n" * "#"^60)
 	println("#############    FULL END-TO-END PIPELINE COMPLETE   ##############")
 	println("#"^60 * "\n")
 
-	if average_weights_df === nothing
+	if final_weights_df === nothing
 		println("Forecasting stage did not produce final weights.")
 	end
 end
